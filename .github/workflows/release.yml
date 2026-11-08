@@ -1,20 +1,58 @@
 name: Release
 
-# Новая версия: поднять __version__ в jarvis/__init__.py, закоммитить и поставить тег vX.Y.Z.
-# Сборка создаст Jarvis-Setup.exe и выложит его в Releases; установленные Джарвисы предложат обновиться.
+# Новая версия: поднять __version__ в jarvis/__init__.py и отправить в main.
+# Если релиза с таким номером ещё нет, сборка создаст Jarvis-Setup.exe и выложит его в Releases
+# (тег vX.Y.Z создаётся вместе с релизом); установленные Джарвисы предложат обновиться.
+# Если релиз уже есть, ничего не собирается. Ручной запуск с publish=false только собирает файл как артефакт.
 on:
   push:
+    branches: [main]
+    paths: ["jarvis/**", "packaging/**", "tools/**", "requirements.txt", ".github/workflows/release.yml"]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Выложить релиз (если такой версии ещё нет)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
   issues: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      needed: ${{ steps.v.outputs.needed }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python3 -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('jarvis/__init__.py', encoding='utf-8').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          PUBLISH=true
+          [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.publish }}" == "false" ]] && PUBLISH=false
+          NEEDED=true
+          if [[ "$PUBLISH" == "true" ]] && gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Релиз v$VERSION уже есть. Чтобы выпустить новый, поднимите __version__ в jarvis/__init__.py."
+            NEEDED=false
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"            # на Windows Python по умолчанию читает и печатает в cp1252
+      PYTHONIOENCODING: utf-8
     defaults:
       run:
         shell: bash
@@ -27,7 +65,7 @@ jobs:
 
       - name: Версия
         run: |
-          VERSION=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('jarvis/__init__.py').read()).group(1))")
+          VERSION=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('jarvis/__init__.py', encoding='utf-8').read()).group(1))")
           echo "JARVIS_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Версия: $VERSION"
           if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
@@ -80,7 +118,7 @@ jobs:
           retention-days: 14
 
       - name: Выложить в Releases
-        if: github.ref_type == 'tag'
+        if: needs.check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -90,7 +128,7 @@ jobs:
             echo
             echo "SHA256: \`$HASH\`"
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" dist-installer/Jarvis-Setup.exe \
+          gh release create "v$JARVIS_VERSION" dist-installer/Jarvis-Setup.exe --target "$GITHUB_SHA" \
             --title "Джарвис $JARVIS_VERSION" --notes-file notes.md 2>&1 | tee -a build.log
 
       - name: Сообщить о сбое задачей в репозитории
@@ -105,4 +143,4 @@ jobs:
             if [[ -f build.log ]]; then tail -n 150 build.log; else echo "журнала нет"; fi
             echo '```'
           } > failure.md
-          gh issue create --title "Сборка ${GITHUB_REF_NAME} не удалась" --body-file failure.md || true
+          gh issue create --title "Сборка v${JARVIS_VERSION:-?} не удалась" --body-file failure.md || true
