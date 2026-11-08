@@ -327,7 +327,7 @@ class TelegramChatLogSystemTests(GuiBase):
         p.btn_test.click()
         self.assertTrue(wait_for(lambda: "Проверка Джарвиса" in p.out.toPlainText()))
         self.assertTrue(wait_for(lambda: "Не прошло" in p.out.toPlainText() or "Всё в порядке" in p.out.toPlainText(), 120))
-        self.assertTrue(p.btn_test.isEnabled())
+        self.assertTrue(wait_for(lambda: p.btn_test.isEnabled()))      # кнопка возвращается чуть позже вывода
         self.assertIn("Hermes найден", p.out.toPlainText())
 
 
