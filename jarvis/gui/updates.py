@@ -22,6 +22,7 @@ class UpdateController(QObject):
         self.error = False
         self.busy = False
         self.progress = (0, 0)
+        self._manual_wanted = False
 
     def _set(self, text: str, error: bool = False) -> None:
         self.text, self.error = text, error
@@ -29,16 +30,22 @@ class UpdateController(QObject):
 
     def check(self, manual: bool = False) -> None:
         if self.busy:
+            # Фоновая проверка уже идёт: щелчок пользователя не теряем, итог покажем как после ручной
+            if manual:
+                self._manual_wanted = True
+                self._set("Проверяю обновления…")
             return
         self.busy = True
+        self._manual_wanted = manual
         if manual:
             self._set("Проверяю обновления…")
 
         def done(rel, err):
             self.busy = False
+            shown = self._manual_wanted
             if err:
                 log.warning("Проверка обновлений: %s", err)
-                self._set(f"Не удалось проверить: {err}" if manual else self.text, bool(manual))
+                self._set(f"Не удалось проверить: {err}" if shown else self.text, bool(shown))
                 return
             self.release = rel
             if rel:

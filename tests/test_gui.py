@@ -370,9 +370,25 @@ class UpdateUiTests(GuiBase):
         updater.check = boom
         before = self.ctx.updates.text
         self.ctx.updates.check(manual=False)
-        QTest.qWait(200)
+        self.assertTrue(wait_for(lambda: not self.ctx.updates.busy))
         self.assertEqual(self.ctx.updates.text, before)
         self.ctx.updates.check(manual=True)
+        self.assertTrue(wait_for(lambda: "нет связи" in self.ctx.updates.text))
+        self.assertTrue(self.ctx.updates.error)
+
+    def test_manual_click_during_background_check_is_not_lost(self):
+        import threading
+        gate = threading.Event()
+
+        def slow():
+            gate.wait(5)
+            raise updater.UpdateError("нет связи с GitHub: тест")
+        updater.check = slow
+        self.ctx.updates.check(manual=False)         # фоновая проверка зависла в ожидании
+        self.assertTrue(self.ctx.updates.busy)
+        self.ctx.updates.check(manual=True)          # пользователь нажал кнопку
+        self.assertIn("Проверяю", self.ctx.updates.text)
+        gate.set()
         self.assertTrue(wait_for(lambda: "нет связи" in self.ctx.updates.text))
         self.assertTrue(self.ctx.updates.error)
 
