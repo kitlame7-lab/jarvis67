@@ -1,0 +1,108 @@
+name: Release
+
+# Новая версия: поднять __version__ в jarvis/__init__.py, закоммитить и поставить тег vX.Y.Z.
+# Сборка создаст Jarvis-Setup.exe и выложит его в Releases; установленные Джарвисы предложат обновиться.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Версия
+        run: |
+          VERSION=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('jarvis/__init__.py').read()).group(1))")
+          echo "JARVIS_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Версия: $VERSION"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "Тег $GITHUB_REF_NAME не совпадает с версией v$VERSION из jarvis/__init__.py" | tee -a build.log
+            exit 1
+          fi
+
+      - name: Зависимости
+        run: pip install -r requirements.txt -r requirements-dev.txt 2>&1 | tee -a build.log
+
+      - name: Значок
+        run: python tools/make_icon.py packaging/jarvis.ico 2>&1 | tee -a build.log
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Сборка приложения
+        run: pyinstaller --noconfirm packaging/jarvis.spec 2>&1 | tee -a build.log
+
+      - name: Сборка инструментов ПК
+        run: pyinstaller --noconfirm packaging/jarvis-pc.spec 2>&1 | tee -a build.log
+
+      - name: Проверка инструментов ПК
+        run: ./dist/pc/jarvis-pc.exe now 2>&1 | tee -a build.log
+
+      - name: Проверка собранного приложения
+        shell: pwsh
+        timeout-minutes: 3
+        env:
+          QT_QPA_PLATFORM: offscreen
+          JARVIS_HOME: ${{ runner.temp }}\jarvis-smoke
+          HERMES_HOME: ${{ runner.temp }}\hermes-smoke
+        run: |
+          $p = Start-Process -FilePath "dist\Jarvis\Jarvis.exe" -ArgumentList "--smoke" -Wait -PassThru
+          $out = if (Test-Path "$env:JARVIS_HOME\smoke.txt") { Get-Content "$env:JARVIS_HOME\smoke.txt" -Raw } else { "smoke.txt не создан" }
+          "smoke: код $($p.ExitCode); $out" | Tee-Object -FilePath build.log -Append
+          if ($p.ExitCode -ne 0 -or $out.Trim() -ne "ok") { exit 1 }
+
+      - name: Установщик
+        run: |
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [[ ! -f "$ISCC" ]]; then choco install innosetup -y --no-progress 2>&1 | tee -a build.log; fi
+          "$ISCC" packaging/installer.iss 2>&1 | tee -a build.log
+          ls -l dist-installer | tee -a build.log
+
+      - name: Сохранить установщик как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-Setup
+          path: dist-installer/Jarvis-Setup.exe
+          retention-days: 14
+
+      - name: Выложить в Releases
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HASH=$(sha256sum dist-installer/Jarvis-Setup.exe | cut -d' ' -f1)
+          {
+            echo "Скачайте **Jarvis-Setup.exe** и запустите. Если Джарвис уже установлен, он сам предложит обновиться."
+            echo
+            echo "SHA256: \`$HASH\`"
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist-installer/Jarvis-Setup.exe \
+            --title "Джарвис $JARVIS_VERSION" --notes-file notes.md 2>&1 | tee -a build.log
+
+      - name: Сообщить о сбое задачей в репозитории
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Запуск: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo '```'
+            if [[ -f build.log ]]; then tail -n 150 build.log; else echo "журнала нет"; fi
+            echo '```'
+          } > failure.md
+          gh issue create --title "Сборка ${GITHUB_REF_NAME} не удалась" --body-file failure.md || true

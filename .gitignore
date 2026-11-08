@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+dist-installer/
+packaging/jarvis.ico
+*.log
+*.egg-info/
+.venv/
