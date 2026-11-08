@@ -33,3 +33,21 @@ class SmokeTests(unittest.TestCase):
     def test_server_name_is_stable(self):
         self.assertEqual(app.server_name(), app.server_name())
         self.assertTrue(app.server_name().startswith("Jarvis-"))
+
+
+class PackagingTests(unittest.TestCase):
+    def test_pc_spec_lists_every_import_of_pc_py(self):
+        """pc.py подгружается как файл, и упаковщик сам его библиотек не видит: список в spec должен быть полным."""
+        import ast
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        tree = ast.parse((root / "jarvis/resources/jarvis-pc/scripts/pc.py").read_text(encoding="utf-8"))
+        needed = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                needed.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                needed.add(node.module)
+        spec = (root / "packaging/jarvis-pc.spec").read_text(encoding="utf-8")
+        missing = sorted(m for m in needed if f'"{m}"' not in spec)
+        self.assertEqual(missing, [], f"добавьте в hiddenimports: {missing}")
