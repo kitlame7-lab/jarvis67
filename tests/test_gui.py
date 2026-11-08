@@ -75,7 +75,10 @@ class WindowTests(GuiBase):
 
     def test_close_without_tray_really_closes(self):
         self.assertIsNone(self.w.tray)          # в тестовой среде трея нет
+        asked = []
+        self.w.quit_requested.connect(lambda: asked.append(1))
         self.w.close()
+        self.assertEqual(asked, [1])            # и приложение завершается, а не висит без окна
         QTest.qWait(20)
         self.assertFalse(self.w.isVisible())
 

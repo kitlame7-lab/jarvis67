@@ -492,3 +492,30 @@ class ProviderCatalogTests(unittest.TestCase):
                 self.assertRegex(p["env"], backend.ENV_NAME_RE)
         self.assertIn("custom", ids)
         self.assertEqual(backend.provider_by_id("custom")["env"], backend.CUSTOM_KEY_ENV)
+
+
+class FirstRunTests(unittest.TestCase):
+    def _settings_with_stub(self):
+        from helpers import STUB
+        paths.SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        paths.SETTINGS_PATH.write_text(json.dumps({"hermes": {"exe": str(STUB)}}), encoding="utf-8")
+
+    def test_wake_word_disabled_once(self):
+        from helpers import CALLS
+        self._settings_with_stub()
+        CALLS.unlink(missing_ok=True)
+        backend.disable_hermes_wake_word()
+        backend.disable_hermes_wake_word()
+        self.assertTrue((paths.DATA_DIR / ".hermes-wake-off").exists())
+        self.assertEqual(CALLS.read_text(encoding="utf-8").count("wake_word.enabled"), 1)
+
+    def test_first_run_installs_skill_and_survives_errors(self):
+        self._settings_with_stub()
+        backend.first_run_setup()
+        self.assertTrue(backend.skill_state()["current"])
+        real = backend.ensure_skill
+        backend.ensure_skill = lambda: (_ for _ in ()).throw(RuntimeError("диск полон"))
+        try:
+            backend.first_run_setup()          # ошибка одного шага не мешает запуску
+        finally:
+            backend.ensure_skill = real

@@ -41,6 +41,9 @@ def smoke_check() -> List[str]:
             importlib.import_module(name)
         except Exception as exc:  # noqa: BLE001
             failed.append(f"{name}: {type(exc).__name__}: {exc}")
+    for rel in ("jarvis-pc/SKILL.md", "jarvis-pc/scripts/pc.py"):
+        if not (paths.RES_DIR / rel).exists():
+            failed.append(f"нет файла {rel} в {paths.RES_DIR}")
     return failed
 
 

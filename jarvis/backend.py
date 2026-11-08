@@ -660,12 +660,19 @@ def ensure_skill() -> None:
 
 
 def disable_hermes_wake_word() -> None:
-    """Встроенное слово-будильник Hermes слушает тот же микрофон, что и Джарвис."""
+    """Встроенное слово-будильник Hermes слушает тот же микрофон, что и Джарвис. Выключаем один раз."""
     from .core import find_hermes, load_settings
+    marker = paths.DATA_DIR / ".hermes-wake-off"
+    if marker.exists():
+        return
     exe = find_hermes(load_settings()["hermes"].get("exe", ""))
-    if exe:
-        subprocess.run([exe, "config", "set", "wake_word.enabled", "false"], capture_output=True,
-                       stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=30)
+    if not exe:
+        return
+    done = subprocess.run([exe, "config", "set", "wake_word.enabled", "false"], capture_output=True,
+                          stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=30)
+    if done.returncode == 0:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1", encoding="utf-8")
 
 
 def import_legacy_settings() -> Optional[Path]:
@@ -689,7 +696,7 @@ def import_legacy_settings() -> Optional[Path]:
 def first_run_setup() -> None:
     """Вызывается при каждом старте приложения: приводит окружение в порядок. Ошибки не мешают запуску."""
     from .core import log
-    for step in (import_legacy_settings, remove_legacy_autostart, ensure_skill):
+    for step in (import_legacy_settings, remove_legacy_autostart, ensure_skill, disable_hermes_wake_word):
         try:
             step()
         except Exception:  # noqa: BLE001

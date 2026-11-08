@@ -237,6 +237,9 @@ class MainWindow(QMainWindow):
                                       "Значок остался в трее. Полностью закрыть: правой кнопкой → «Выход».",
                                       QSystemTrayIcon.MessageIcon.Information, 5000)
             return
+        if not self.quitting:
+            # Без значка в трее окно — единственный вход в приложение: закрытие означает выход
+            self.quit_requested.emit()
         super().closeEvent(event)
 
 
