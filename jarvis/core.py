@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import paths
+from . import models, paths
 from .paths import IS_WIN, LOG_PATH, ensure_dirs
 
 # Приложение без консоли: stdout/stderr могут отсутствовать
@@ -83,6 +83,7 @@ DEFAULTS: Dict[str, Any] = {
         "language": "ru",
         "beam_size": 1,
         "initial_prompt": "Джарвис, ",
+        "mirror": "",                # свой адрес Hugging Face (например зеркало), пробуется первым
     },
     "tts": {
         "enabled": True,
@@ -350,14 +351,20 @@ class Transcriber:
         self.cfg = cfg
         self._model = None
 
-    def load(self) -> None:
+    def load(self, on_progress: Optional[Callable[["models.Progress"], None]] = None,
+             cancel: Optional[threading.Event] = None) -> None:
+        """Скачивает модель при необходимости (с прогрессом и отменой) и загружает её в память."""
         if self._model is not None:
             return
+        notify = on_progress or (lambda _p: None)
+        endpoints = [e for e in [self.cfg.get("mirror", "").strip()] if e] + models.DEFAULT_ENDPOINTS
+        log.info("Готовлю модель распознавания %s (%s)", self.cfg["model"], self.cfg["device"])
+        path = models.fetch(self.cfg["model"], notify, cancel or threading.Event(), endpoints=endpoints)
+        notify(models.Progress("loading"))
         from faster_whisper import WhisperModel
-        log.info("Загружаю модель распознавания %s (%s)...", self.cfg["model"], self.cfg["device"])
-        self._model = WhisperModel(self.cfg["model"], device=self.cfg["device"],
-                                   compute_type=self.cfg["compute_type"])
-        log.info("Модель готова")
+        t0 = time.monotonic()
+        self._model = WhisperModel(path, device=self.cfg["device"], compute_type=self.cfg["compute_type"])
+        log.info("Модель готова за %.1f с", time.monotonic() - t0)
 
     def transcribe(self, audio) -> str:
         self.load()
@@ -405,14 +412,32 @@ def list_voices(locale_prefix: str = "ru-") -> List[Dict[str, str]]:
     return list(FALLBACK_VOICES)
 
 
-def play_mp3(path: str) -> None:
-    """Проигрывает mp3 средствами Windows (MCI), без ffmpeg и плееров."""
+def play_mp3(path: str, slack_s: float = 5.0) -> None:
+    """Проигрывает mp3 средствами Windows (MCI), без ffmpeg и плееров.
+
+    Раньше стояло `play … wait`: при сбое звукового драйвера вызов не возвращался, микрофон оставался заглушённым,
+    а ассистент молчал и «висел». Теперь ждём не дольше длины записи плюс запас."""
     mci = ctypes.windll.winmm.mciSendStringW  # type: ignore[attr-defined]
     alias = f"jarvis{os.getpid()}{threading.get_ident()}"
-    mci(f'open "{path}" type mpegvideo alias {alias}', None, 0, None)
+    buf = ctypes.create_unicode_buffer(128)
+    err = mci(f'open "{path}" type mpegvideo alias {alias}', None, 0, None)
+    if err:
+        raise RuntimeError(f"не удалось открыть звук (код MCI {err})")
     try:
-        mci(f"play {alias} wait", None, 0, None)
+        mci(f"status {alias} length", buf, 127, None)
+        length_s = int(buf.value or 0) / 1000.0 if (buf.value or "").isdigit() else 30.0
+        err = mci(f"play {alias}", None, 0, None)
+        if err:
+            raise RuntimeError(f"не удалось воспроизвести звук (код MCI {err})")
+        deadline = time.monotonic() + length_s + slack_s
+        while time.monotonic() < deadline:
+            mci(f"status {alias} mode", buf, 127, None)
+            if buf.value == "stopped":
+                return
+            time.sleep(0.1)
+        log.warning("Воспроизведение не закончилось за %.0f с, обрываю", length_s + slack_s)
     finally:
+        mci(f"stop {alias}", None, 0, None)
         mci(f"close {alias}", None, 0, None)
 
 
@@ -710,7 +735,7 @@ class Assistant:
                 reply = future.result(timeout=float(self.cfg["hermes"]["ack_after_s"]))
             except FutureTimeout:
                 self.speaker.say(f"Одну секунду, {self.address}.")
-                reply = future.result()
+                reply = future.result()  # doctor: ok(wait-forever) — у Hermes.run свой предел timeout_s
             self.remember(command, reply)
             self._event("reply", reply)
             self.speaker.say(reply)

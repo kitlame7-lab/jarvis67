@@ -526,7 +526,7 @@ def run_hermes(args: List[str], emit: Callable[[str], None], timeout: float = 90
         assert proc.stdout is not None
         for line in proc.stdout:
             emit(ANSI_RE.sub("", line.rstrip()))
-        return proc.wait()
+        return proc.wait()  # doctor: ok(wait-forever) — вывод прочитан до конца, зависшую программу убивает таймер
     finally:
         timer.cancel()
 
@@ -731,7 +731,7 @@ def mic_level(device: str = "", seconds: float = 2.5) -> Dict[str, float]:
     import sounddevice as sd
     dev = int(device) if str(device).isdigit() else (device or None)
     frames = sd.rec(int(seconds * 16000), samplerate=16000, channels=1, dtype="float32", device=dev)
-    sd.wait()
+    sd.sleep(int(seconds * 1000) + 400)      # без sd.wait(): зависший драйвер не должен держать окно
     data = frames[:, 0]
     return {"rms": float(np.sqrt(np.mean(np.square(data)))), "peak": float(np.max(np.abs(data)))}
 

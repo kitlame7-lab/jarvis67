@@ -1,5 +1,6 @@
 """Тесты для инструментов управления ПК (pc.py) в режиме сухого прогона."""
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,138 @@ class ToolFuncTests(unittest.TestCase):
         self.assertEqual(pc.plural(5, "файл", "файла", "файлов"), "файлов")
         self.assertEqual(pc.plural(11, "файл", "файла", "файлов"), "файлов")
         self.assertEqual(pc.plural(21, "файл", "файла", "файлов"), "файл")
+
+
+class _Real:
+    """Временно выключает сухой прогон и подменяет вызов программ, чтобы проверить, что именно было бы запущено."""
+    def __init__(self, win=True, stdout="", returncode=0):
+        self.win, self.stdout, self.returncode, self.calls = win, stdout, returncode, []
+
+    def __enter__(self):
+        self.saved = (pc.DRY, pc.IS_WIN, subprocess.run)
+        pc.DRY, pc.IS_WIN = False, self.win
+
+        def fake_run(argv, **kw):
+            self.calls.append((argv, kw))
+            return subprocess.CompletedProcess(argv, self.returncode, self.stdout.encode("cp866", "replace"), b"")
+        subprocess.run = fake_run
+        return self
+
+    def __exit__(self, *exc):
+        pc.DRY, pc.IS_WIN, subprocess.run = self.saved
+
+
+class SafetyTests(unittest.TestCase):
+    """Дефекты, найденные анализатором: кодировка, кавычки в PowerShell, зависания."""
+
+    def test_powershell_gets_data_only_through_environment(self):
+        nasty = 'C:\\Users\\Иван\\a$b "q" `x`.txt'
+        with _Real() as r:
+            pc.run_ps("Test-Path $env:JARVIS_ARG", {"JARVIS_ARG": nasty})
+        argv, kw = r.calls[0]
+        self.assertNotIn(nasty, " ".join(argv))
+        self.assertEqual(kw["env"]["JARVIS_ARG"], nasty)
+        self.assertEqual(kw["timeout"], 30.0)
+
+    def test_delete_uses_recycle_bin_and_env_for_path(self):
+        target = Path(tempfile.mkdtemp()) / 'a$b "x".txt'
+        target.write_text("x", encoding="utf-8")
+        with _Real() as r:
+            out = pc.main(["files", "delete", str(target)])
+        self.assertEqual(out, 0)
+        argv, kw = r.calls[0]
+        script = argv[-1]
+        self.assertIn("SendToRecycleBin", script)
+        self.assertIn("DeleteDirectory", script, "папки тоже должны удаляться в корзину")
+        self.assertNotIn(str(target), script)
+        self.assertEqual(kw["env"]["JARVIS_ARG"], str(target))
+
+    def test_every_subprocess_call_has_a_timeout(self):
+        with _Real(stdout="") as r:
+            pc.run_cmd(["ping", "x"])
+            pc.run_ps("1")
+        for _argv, kw in r.calls:
+            self.assertIn("timeout", kw)
+
+    def test_hung_program_becomes_a_readable_error(self):
+        saved = subprocess.run
+
+        def hang(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        subprocess.run = hang
+        pc.DRY = False
+        try:
+            with self.assertRaises(pc.ToolError) as ctx:
+                pc.run_cmd(["tasklist"], timeout=1)
+            self.assertIn("не ответила", str(ctx.exception))
+        finally:
+            subprocess.run = saved
+            pc.DRY = True
+
+    def test_processes_parse_russian_tasklist_with_nbsp_and_sort_by_memory(self):
+        csv_text = ('"chrome.exe","100","Console","1","412\u00a0300 КБ"\n'
+                    '"notepad.exe","200","Console","1","8\u00a0100 КБ"\n'
+                    '"Code.exe","300","Console","1","1\u00a0200\u00a0000 КБ"\n')
+        with _Real(stdout=csv_text) as r:
+            r.stdout = csv_text
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = pc.main(["processes"])
+        self.assertEqual(code, 0)
+        lines = [ln.strip() for ln in buf.getvalue().splitlines()[1:]]
+        self.assertTrue(lines[0].startswith("Code.exe"), lines)
+        self.assertTrue(lines[1].startswith("chrome.exe"), lines)
+
+    def test_sysinfo_works_without_wmic(self):
+        text = pc.cmd_sysinfo(None)
+        self.assertIn("Процессор", text)
+        self.assertIn("диск", text)
+
+
+    def test_file_search_finds_nested_file_and_skips_junk_dirs(self):
+        base = Path(tempfile.mkdtemp())
+        (base / "sub" / "deep").mkdir(parents=True)
+        (base / "sub" / "deep" / "Отчёт_2026.xlsx").write_text("x", encoding="utf-8")
+        (base / "node_modules").mkdir()
+        (base / "node_modules" / "отчёт_мусор.txt").write_text("x", encoding="utf-8")
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pc.main(["files", "search", "отчёт", "--to", str(base)])
+        out = buf.getvalue()
+        self.assertIn("Отчёт_2026.xlsx", out)
+        self.assertNotIn("мусор", out)
+
+    def test_file_search_respects_time_budget(self):
+        base = Path(tempfile.mkdtemp())
+        for i in range(30):
+            (base / f"d{i}").mkdir()
+        saved = pc.SEARCH_BUDGET_S
+        pc.SEARCH_BUDGET_S = -1.0          # бюджет исчерпан сразу
+        try:
+            walked = list(pc._walk(base, budget=-1.0))
+        finally:
+            pc.SEARCH_BUDGET_S = saved
+        self.assertEqual(len(walked), 1, "обход должен остановиться по времени после первой папки")
+
+    def test_clipboard_text_goes_through_environment(self):
+        with _Real() as r:
+            pc.main(["clipboard", "set", 'привет "мир" $x'])
+        argv, kw = r.calls[0]
+        self.assertNotIn("привет", argv[-1])
+        self.assertEqual(kw["env"]["JARVIS_ARG"], 'привет "мир" $x')
+
+    def test_screenshot_is_dpi_aware_and_uses_env_path(self):
+        dest = str(Path(tempfile.mkdtemp()) / "s.png")
+        with _Real() as r:
+            pc.main(["screenshot", dest])
+        argv, kw = r.calls[0]
+        self.assertIn("SetProcessDPIAware", argv[-1])
+        self.assertNotIn(dest, argv[-1])
+        self.assertEqual(kw["env"]["JARVIS_ARG"], dest)
 
 
 if __name__ == "__main__":

@@ -6,16 +6,33 @@ import unittest
 
 
 from helpers import STUB
-from jarvis import backend, service
+from jarvis import backend, diag, models, service
 from jarvis.service import AssistantService
 
 
 class FakeStt:
+    """Подставное распознавание. Режимы нужны, чтобы воспроизвести настоящие случаи зависания загрузки."""
+    mode = "ok"          # ok | download (идёт, пока не отменят) | uncancellable (держит 1.2 с, отмену не видит) | fail
+    loads = 0
+
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def load(self):
-        pass
+    def load(self, on_progress=None, cancel=None):
+        FakeStt.loads += 1
+        notify = on_progress or (lambda p: None)
+        if FakeStt.mode == "download":
+            done = 0
+            while not cancel.is_set():
+                done += 1_000_000
+                notify(models.Progress("download", done, 100_000_000, 1_000_000.0, "https://hf-mirror.com", 2))
+                time.sleep(0.02)
+            raise models.Cancelled()
+        if FakeStt.mode == "uncancellable":
+            notify(models.Progress("loading"))
+            time.sleep(1.2)
+        if FakeStt.mode == "fail":
+            raise models.DownloadFailed("Не удалось скачать модель распознавания речи.\n  нет сети")
 
     def transcribe(self, audio):
         return audio
@@ -63,7 +80,7 @@ class FailingRec(FakeRec):
         raise OSError("микрофон отключён")
 
 
-class ServiceTests(unittest.TestCase):
+class ServiceCase(unittest.TestCase):
     def setUp(self):
         self.states, self.events = [], []
         backend.save_settings({"greeting": False})
@@ -76,7 +93,10 @@ class ServiceTests(unittest.TestCase):
         self.old = (service.Transcriber, service.Recorder, service.Speaker)
         service.Transcriber, service.Recorder = FakeStt, FakeRec
         FakeRec.feed, FakeRec.opened = [], 0
-        self.svc = AssistantService(lambda s, d: self.states.append(s), lambda k, t: self.events.append((k, t)))
+        FakeStt.mode, FakeStt.loads = "ok", 0
+        self.progress = []
+        self.svc = AssistantService(lambda s, d: self.states.append(s), lambda k, t: self.events.append((k, t)),
+                                    lambda f, t: self.progress.append((f, t)))
         self.addCleanup(self.cleanup)
 
     def cleanup(self):
@@ -91,6 +111,9 @@ class ServiceTests(unittest.TestCase):
             time.sleep(0.05)
         return False
 
+
+
+class ServiceTests(ServiceCase):
     def test_start_listen_answer_stop(self):
         FakeRec.feed = ["Джарвис, какая погода"]
         self.svc.start()
@@ -161,3 +184,83 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(self.wait(lambda: any(k == "error" and "Hermes" in t for k, t in self.events)))
         finally:
             __import__("os").environ["PATH"] = old_path
+
+
+class SlowStartTests(ServiceCase):
+    """Случаи, из-за которых окно навсегда оставалось на «Загружаюсь…»."""
+
+    def test_progress_is_reported_during_download(self):
+        FakeStt.mode = "download"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: any(f > 0 for f, _ in self.progress)))
+        fraction, text = [x for x in self.progress if x[0] > 0][-1]
+        self.assertGreater(fraction, 0)
+        self.assertIn("МБ", text)
+        self.assertEqual(self.svc.state, service.LOADING)
+
+    def test_stop_during_download_is_immediate(self):
+        FakeStt.mode = "download"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: any(f > 0 for f, _ in self.progress)))
+        t0 = time.monotonic()
+        self.svc.stop()
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertFalse(self.svc.running)
+        self.assertEqual(self.svc.state, service.STOPPED)
+
+    def test_restart_during_download_starts_again(self):
+        FakeStt.mode = "download"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: FakeStt.loads == 1 and any(f > 0 for f, _ in self.progress)))
+        FakeStt.mode = "ok"                      # на второй раз «сеть наладилась»
+        self.svc.restart()
+        self.assertTrue(self.wait(lambda: self.svc.state == service.LISTENING), self.states[-5:])
+        self.assertEqual(FakeStt.loads, 2)
+
+    def test_restart_while_load_cannot_be_cancelled_still_restarts(self):
+        """Загрузку в память прервать нельзя: просьба «перезапустить» не должна теряться."""
+        FakeStt.mode = "uncancellable"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: FakeStt.loads == 1))
+        FakeStt.mode = "ok"
+        self.svc.stop(wait=0.2)
+        self.assertTrue(self.svc.running, "поток ещё занят загрузкой")
+        self.svc.start()                          # раньше эта просьба молча терялась
+        self.assertTrue(self.wait(lambda: self.svc.state == service.LISTENING, timeout=10), self.states[-5:])
+        self.assertEqual(FakeStt.loads, 2)
+
+    def test_stop_cancels_pending_restart(self):
+        FakeStt.mode = "uncancellable"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: FakeStt.loads == 1))
+        self.svc.stop(wait=0.1)
+        self.svc.start()
+        self.svc.stop(wait=0.1)
+        time.sleep(1.8)
+        self.assertFalse(self.svc.running)
+        self.assertEqual(FakeStt.loads, 1)
+
+    def test_download_failure_is_an_error_with_reason(self):
+        FakeStt.mode = "fail"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: self.svc.state == service.ERROR))
+        self.assertTrue(any(k == "error" and "нет сети" in t for k, t in self.events))
+        self.assertTrue(any("загрузка модели" == e["source"] for e in diag.recent_errors()))
+
+    def test_watchdog_reports_a_stuck_stage(self):
+        old = dict(service.PATIENCE_S), service.WATCH_EVERY_S
+        service.PATIENCE_S[service.STAGE_MEMORY] = 0.3
+        service.WATCH_EVERY_S = 0.1
+        self.addCleanup(lambda: (service.PATIENCE_S.update(old[0]), setattr(service, "WATCH_EVERY_S", old[1])))
+        FakeStt.mode = "uncancellable"
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: any(k == "error" and "не двигается" in t for k, t in self.events), timeout=6),
+                        self.events)
+        self.assertTrue(any(e["source"] == "запуск" for e in diag.recent_errors()))
+
+    def test_timeline_records_stages(self):
+        self.svc.start()
+        self.assertTrue(self.wait(lambda: self.svc.state == service.LISTENING))
+        stages = [t["stage"] for t in diag.TIMELINE.snapshot()]
+        self.assertIn(service.STAGE_MIC, stages)
+        self.assertIsNone(diag.TIMELINE.current(), "в состоянии «Слушаю» открытых этапов быть не должно")

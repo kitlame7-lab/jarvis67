@@ -10,9 +10,9 @@ a = Analysis(  # noqa: F821
     datas=[(str(ROOT / "jarvis" / "resources" / "jarvis-pc" / "scripts" / "pc.py"),
             "jarvis/resources/jarvis-pc/scripts")],
     # pc.py подгружается как файл, поэтому его библиотеки перечисляем сами
-    hiddenimports=["__future__", "argparse", "ctypes", "ctypes.wintypes", "datetime", "json", "os", "pathlib",
-                   "shutil", "subprocess", "sys", "time", "typing", "urllib.error", "urllib.parse",
-                   "urllib.request", "xml.etree.ElementTree"],
+    hiddenimports=["__future__", "argparse", "csv", "ctypes", "ctypes.wintypes", "datetime", "io", "json", "os",
+                   "pathlib", "re", "shutil", "socket", "subprocess", "sys", "time", "typing", "urllib.error",
+                   "urllib.parse", "urllib.request", "winreg", "xml.etree.ElementTree"],
     excludes=["tkinter", "numpy", "PySide6"],
 )
 pyz = PYZ(a.pure)  # noqa: F821
