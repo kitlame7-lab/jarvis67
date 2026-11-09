@@ -556,8 +556,8 @@ def cmd_files(a) -> str:
             return f"[сухой прогон] Удалил бы {p}"
         if IS_WIN:
             # Удаление в корзину через PowerShell
-            ps = (f'Add-Type -AssemblyName Microsoft.VisualBasic;'
-                  f'[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
+            ps = ('Add-Type -AssemblyName Microsoft.VisualBasic;'
+                  '[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
                   f'"{p}", "OnlyErrorDialogs", "SendToRecycleBin")')
             res = run_cmd(["powershell", "-NoProfile", "-Command", ps])
             if res.returncode != 0:
@@ -768,14 +768,14 @@ def cmd_screenshot(a) -> str:
         dest = str(Path.home() / "Desktop" / f"screenshot_{dt.datetime.now():%Y%m%d_%H%M%S}.png")
     if DRY:
         return f"[сухой прогон] Скриншот → {dest}"
-    ps = (f'Add-Type -AssemblyName System.Windows.Forms;'
-          f'$bmp = [System.Windows.Forms.Screen]::PrimaryScreen;'
-          f'$bounds = $bmp.Bounds;'
-          f'$bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);'
-          f'$graphics = [System.Drawing.Graphics]::FromImage($bitmap);'
-          f'$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);'
+    ps = ('Add-Type -AssemblyName System.Windows.Forms;'
+          '$bmp = [System.Windows.Forms.Screen]::PrimaryScreen;'
+          '$bounds = $bmp.Bounds;'
+          '$bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);'
+          '$graphics = [System.Drawing.Graphics]::FromImage($bitmap);'
+          '$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);'
           f'$bitmap.Save("{dest}");'
-          f'$graphics.Dispose();$bitmap.Dispose()')
+          '$graphics.Dispose();$bitmap.Dispose()')
     res = run_cmd(["powershell", "-NoProfile", "-Command", ps])
     if res.returncode != 0:
         raise ToolError(f"Не удалось сделать скриншот: {(res.stderr or '')[:200]}")
@@ -851,12 +851,12 @@ def cmd_notify(a) -> str:
         raise ToolError("Укажите текст уведомления.")
     if DRY or not IS_WIN:
         return f"[сухой прогон] Уведомление: {text}"
-    ps = (f'Add-Type -AssemblyName System.Windows.Forms;'
-          f'$n = New-Object System.Windows.Forms.NotifyIcon;'
-          f'$n.Icon = [System.Drawing.SystemIcons]::Information;'
-          f'$n.Visible = $true;'
-          f'$n.ShowBalloonTip(5000, "Джарвис", $env:JARVIS_NOTIFY, "Info");'
-          f'Start-Sleep 6; $n.Dispose()')
+    ps = ('Add-Type -AssemblyName System.Windows.Forms;'
+          '$n = New-Object System.Windows.Forms.NotifyIcon;'
+          '$n.Icon = [System.Drawing.SystemIcons]::Information;'
+          '$n.Visible = $true;'
+          '$n.ShowBalloonTip(5000, "Джарвис", $env:JARVIS_NOTIFY, "Info");'
+          'Start-Sleep 6; $n.Dispose()')
     env = dict(os.environ, JARVIS_NOTIFY=text)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
