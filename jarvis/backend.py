@@ -410,7 +410,15 @@ def sanitize_settings(incoming: Dict[str, Any]) -> Dict[str, Any]:
             ao["auto_threshold"] = a["auto_threshold"]
         if "silence_threshold" in a:
             ao["silence_threshold"] = clamp(a["silence_threshold"], 0.002, 0.3, 0.012)
+        if a.get("barge_in") in ("voice", "wake", "off"):
+            ao["barge_in"] = a["barge_in"]
+        if "silence_tail_ms" in a:
+            ao["silence_tail_ms"] = int(clamp(a["silence_tail_ms"], 300, 2000, 600))
         out["audio"] = ao
+
+    nt = incoming.get("notes")
+    if isinstance(nt, dict) and isinstance(nt.get("dir"), str):
+        out["notes"] = {"dir": nt["dir"].strip()[:400]}
 
     st = incoming.get("stt")
     if isinstance(st, dict) and st.get("model") in ("tiny", "base", "small", "medium", "large-v3"):
@@ -485,6 +493,7 @@ def public_settings() -> Dict[str, Any]:
         "hermes": {k: cfg["hermes"].get(k) for k in ("provider", "model", "yolo")},
         "game_mode": {"kill": list((user.get("game_mode") or {}).get("kill", []))},
         "apps": dict(user.get("apps", {})),
+        "notes": {"dir": str((user.get("notes") or {}).get("dir", ""))},
         "updates": {"auto_check": bool(cfg["updates"]["auto_check"])},
     }
 

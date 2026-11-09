@@ -13,7 +13,7 @@ from ..core import log
 from . import theme
 from .common import Page, UiBus, background
 from .pages import AbilitiesPage, HearingPage, HomePage, VoicePage
-from .pages2 import SystemPage
+from .pages2 import SystemPage, TelegramPage
 from .pages3 import ConnectionsPage, DiagnosticsPage, TasksPage
 from .updates import UpdateController, auto_check_enabled
 
@@ -26,6 +26,7 @@ class Context(QObject):
     event = Signal(str, str)
     progress = Signal(float, str)
     recording_changed = Signal(bool)
+    telegram_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -35,6 +36,7 @@ class Context(QObject):
             on_event=lambda k, t: self.bus.post(lambda: self.event.emit(k, t)),
             on_progress=lambda f, t: self.bus.post(lambda: self.progress.emit(f, t)),
             on_recording=lambda r: self.bus.post(lambda: self.recording_changed.emit(r)))
+        self.service.on_telegram = lambda: self.bus.post(self.telegram_changed.emit)
         self.updates = UpdateController(self.bus)
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -143,7 +145,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(right, 1)
 
         self.pages: List[Page] = []
-        for cls in (HomePage, TasksPage, VoicePage, HearingPage, AbilitiesPage, ConnectionsPage, DiagnosticsPage, SystemPage):
+        for cls in (HomePage, TasksPage, TelegramPage, VoicePage, HearingPage, AbilitiesPage, ConnectionsPage,
+                    DiagnosticsPage, SystemPage):
             page = cls(ctx)
             self.pages.append(page)
             self.stack.addWidget(page)
@@ -317,4 +320,4 @@ def shutdown(app: QApplication, ctx: Context, window: Optional[MainWindow]) -> N
     def finish(_r=None, _e=None) -> None:
         log.info("Джарвис завершает работу")
         app.quit()
-    background(ctx.bus, ctx.service.stop, finish)
+    background(ctx.bus, lambda: (ctx.service.stop_telegram(), ctx.service.stop()), finish)

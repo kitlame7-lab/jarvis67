@@ -518,6 +518,10 @@ STT_MODELS = [
 ]
 
 
+BARGE_MODES = [("voice", "Любой фразой (лучше в наушниках)"), ("wake", "Только по имени «Джарвис…»"),
+               ("off", "Не перебивать")]
+
+
 class HearingPage(Page):
     title = "Слух"
     lead = "Какой микрофон слушать, как Джарвис понимает речь и по каким словам просыпается."
@@ -568,6 +572,19 @@ class HearingPage(Page):
         wake.add(field("После ответа можно продолжать без имени", self.follow))
         self.col.addWidget(wake)
 
+        talk = Card("Разговор в реальном времени",
+                    "Джарвис слушает и пока говорит: новая фраза обрывает его ответ, «стоп» или «хватит» — замолкает сразу.")
+        self.barge = QComboBox()
+        for key, label in BARGE_MODES:
+            self.barge.addItem(label, key)
+        talk.add(field("Перебивание", self.barge,
+                       "Если Джарвис перебивает сам себя через колонки, выберите «только по имени» или наденьте наушники."))
+        self.tail = QComboBox()
+        for ms, label in ((450, "Быстро — 0,45 с"), (600, "Обычно — 0,6 с"), (900, "Медленно — 0,9 с (говорю с паузами)")):
+            self.tail.addItem(label, ms)
+        talk.add(field("Пауза, после которой фраза считается законченной", self.tail))
+        self.col.addWidget(talk)
+
         act = Card()
         self.btn_save = primary("Сохранить")
         act.row(self.btn_save)
@@ -595,6 +612,9 @@ class HearingPage(Page):
         set_combo(self.stt, cfg["stt"]["model"])
         self.words.setText(", ".join(cfg["wake"]["words"]))
         self.follow.setValue(float(cfg["wake"]["followup_seconds"]))
+        set_combo(self.barge, str(a.get("barge_in", "voice")))
+        tail = int(a.get("silence_tail_ms", 600))
+        set_combo(self.tail, tail, f"{tail} мс")
 
     def test_mic(self) -> None:
         self.btn_mic.setEnabled(False)
@@ -623,7 +643,8 @@ class HearingPage(Page):
             return
         backend.save_settings({
             "audio": {"device": self.device.currentData() or "", "auto_threshold": self.auto.isChecked(),
-                      "silence_threshold": self.thr.value() / 1000},
+                      "silence_threshold": self.thr.value() / 1000, "barge_in": self.barge.currentData(),
+                      "silence_tail_ms": int(self.tail.currentData())},
             "stt": {"model": self.stt.currentData()},
             "wake": {"words": words, "followup_seconds": self.follow.value()}})
         self.ctx.restart_service_soon()
@@ -664,6 +685,14 @@ class AbilitiesPage(Page):
         apps.row(self.btn_add, self.btn_del)
         self.col.addWidget(apps)
 
+        notes = Card("Заметки", "«Джарвис, запиши заметку …» сохраняет текст файлом .md в эту папку.")
+        self.notes_dir = QLineEdit()
+        self.notes_dir.setPlaceholderText("Документы\\Заметки Джарвиса")
+        notes.add(field("Папка заметок (пусто — по умолчанию)", self.notes_dir))
+        self.btn_notes = button("Открыть папку заметок")
+        notes.row(self.btn_notes)
+        self.col.addWidget(notes)
+
         perm = Card("Права")
         self.yolo = QCheckBox("Выполнять действия без подтверждения (режим yolo)")
         perm.add(self.yolo)
@@ -678,6 +707,7 @@ class AbilitiesPage(Page):
         act.add(self.status)
         self.col.addWidget(act)
 
+        self.btn_notes.clicked.connect(self.open_notes)
         self.btn_add.clicked.connect(lambda: self.table.insertRow(self.table.rowCount()))
         self.btn_del.clicked.connect(self.remove_row)
         self.btn_save.clicked.connect(self.save)
@@ -697,6 +727,12 @@ class AbilitiesPage(Page):
             self.table.setItem(r, 0, QTableWidgetItem(name))
             self.table.setItem(r, 1, QTableWidgetItem(cmd))
         self.yolo.setChecked(bool(pub["hermes"]["yolo"]))
+        self.notes_dir.setText(pub["notes"]["dir"])
+
+    def open_notes(self) -> None:
+        from .. import agent
+        background(self.ctx.bus, lambda: agent.run_pc(["notes", "open"]),
+                   lambda res, err: self.status.bad(str(err or res[1])) if err or not res[0] else self.status.ok(res[1]))
 
     def save(self) -> None:
         apps = {}
@@ -706,7 +742,7 @@ class AbilitiesPage(Page):
                 apps[a.text().strip().lower()] = b.text().strip()
         kill = [x.strip() for x in self.kill.toPlainText().splitlines() if x.strip()]
         backend.save_settings({"city": self.city.text(), "game_mode": {"kill": kill}, "apps": apps,
-                               "hermes": {"yolo": self.yolo.isChecked()}})
+                               "hermes": {"yolo": self.yolo.isChecked()}, "notes": {"dir": self.notes_dir.text()}})
         self.ctx.restart_service_soon()
         self.status.ok("Сохранено.")
 

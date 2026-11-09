@@ -28,6 +28,7 @@ import argparse
 import ctypes
 import datetime as dt
 import difflib
+import html
 import json
 import os
 import re
@@ -56,6 +57,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "city": "Москва",
     "game_mode": {"kill": []},
     "apps": {},
+    "notes": {"dir": ""},
 }
 
 
@@ -93,6 +95,8 @@ def load_settings() -> Dict[str, Any]:
             cfg["game_mode"].update(user["game_mode"])
         if isinstance(user.get("apps"), dict):
             cfg["apps"].update(user["apps"])
+        if isinstance(user.get("notes"), dict):
+            cfg["notes"].update(user["notes"])
     return cfg
 
 
@@ -328,6 +332,11 @@ def cmd_open(a) -> str:
     table = dict(BUILTIN_APPS)
     table.update({k.lower(): v for k, v in cfg["apps"].items()})
     target = table.get(raw.lower(), raw)
+    if target == raw and not raw.startswith(("http://", "https://", "ms-settings:", "mailto:")) \
+            and not os.path.exists(raw):
+        shortcut = find_app(raw)                     # программа из меню «Пуск»: «открой телеграм», «открой фотошоп»
+        if shortcut is not None:
+            target = str(shortcut)
 
     if DRY or not IS_WIN:
         print(f"[сухой прогон] открыть: {target}", file=sys.stderr)
@@ -1442,6 +1451,498 @@ def cmd_task(a) -> str:
 
 
 
+
+# --------------------------------------------------------------------------
+# Известные папки, программы меню «Пуск»
+# --------------------------------------------------------------------------
+
+KNOWN_FOLDERS = {
+    # имя -> (значение в реестре User Shell Folders, папка по умолчанию)
+    "рабочий стол": ("Desktop", "Desktop"), "desktop": ("Desktop", "Desktop"),
+    "документы": ("Personal", "Documents"), "мои документы": ("Personal", "Documents"), "documents": ("Personal", "Documents"),
+    "загрузки": ("{374DE290-123F-4565-9164-39C4925E467B}", "Downloads"), "downloads": ("{374DE290-123F-4565-9164-39C4925E467B}", "Downloads"),
+    "изображения": ("My Pictures", "Pictures"), "картинки": ("My Pictures", "Pictures"), "фото": ("My Pictures", "Pictures"),
+    "музыка": ("My Music", "Music"), "видео": ("My Video", "Videos"),
+}
+
+
+def known_folder(name: str) -> Optional[Path]:
+    key = (name or "").strip().lower().replace("ё", "е")
+    if key not in KNOWN_FOLDERS:
+        return None
+    reg, default = KNOWN_FOLDERS[key]
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+                value, _ = winreg.QueryValueEx(k, reg)
+                return Path(os.path.expandvars(value))
+        except OSError:
+            pass
+    return Path.home() / default
+
+
+def resolve_place(raw: str) -> Path:
+    """Путь, известная папка («загрузки») или папка с таким именем на рабочем столе / в профиле."""
+    raw = (raw or "").strip().strip('"')
+    if not raw:
+        raise ToolError("Не сказано, какая папка.")
+    kf = known_folder(raw)
+    if kf is not None:
+        return kf
+    p = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if p.is_absolute():
+        return p
+    for base in [known_folder("рабочий стол"), known_folder("документы"), known_folder("загрузки"), Path.home()]:
+        if base is None or not base.is_dir():
+            continue
+        cand = base / raw
+        if cand.exists():
+            return cand
+        try:
+            names = [c for c in base.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        low = raw.lower().replace("ё", "е")
+        for c in names:
+            if c.name.lower().replace("ё", "е") == low:
+                return c
+        best = difflib.get_close_matches(low, [c.name.lower() for c in names], n=1, cutoff=0.8)
+        if best:
+            return next(c for c in names if c.name.lower() == best[0])
+    return (known_folder("рабочий стол") or Path.home()) / raw
+
+
+def start_menu_dirs() -> List[Path]:
+    dirs = []
+    for env in ("ProgramData", "APPDATA"):
+        base = os.environ.get(env)
+        if base:
+            dirs.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    extra = os.environ.get("JARVIS_START_MENU")
+    if extra:
+        dirs.append(Path(extra))
+    return dirs
+
+
+def list_apps() -> List[Path]:
+    out: List[Path] = []
+    for d in start_menu_dirs():
+        if d.is_dir():
+            for f in d.rglob("*"):
+                if f.suffix.lower() in (".lnk", ".url", ".appref-ms") and "uninstall" not in f.name.lower() \
+                        and "удал" not in f.name.lower():
+                    out.append(f)
+    return out
+
+
+def find_app(query: str) -> Optional[Path]:
+    q = query.lower().replace("ё", "е").strip()
+    if not q:
+        return None
+    apps = list_apps()
+    names = [a.stem.lower().replace("ё", "е") for a in apps]
+    for a, n in zip(apps, names):
+        if n == q:
+            return a
+    starts = [(len(n), a) for a, n in zip(apps, names) if n.startswith(q) or q in n.split()]
+    if starts:
+        return sorted(starts, key=lambda x: x[0])[0][1]
+    best = difflib.get_close_matches(q, names, n=1, cutoff=0.75)
+    return apps[names.index(best[0])] if best else None
+
+
+def cmd_apps(a) -> str:
+    q = " ".join(a.query).strip().lower()
+    apps = list_apps()
+    if q:
+        apps = [x for x in apps if q in x.stem.lower()] or ([find_app(q)] if find_app(q) else [])
+    if not apps:
+        return "Таких программ в меню «Пуск» не нашёл." if q else "Меню «Пуск» пустое или недоступно."
+    names = sorted({x.stem for x in apps})
+    return f"Программ: {len(names)}. " + "; ".join(names[:40]) + (" …" if len(names) > 40 else "")
+
+
+# --------------------------------------------------------------------------
+# Заметки
+# --------------------------------------------------------------------------
+
+def notes_dir() -> Path:
+    env = os.environ.get("JARVIS_NOTES")
+    if env:
+        return Path(env)
+    custom = str(load_settings().get("notes", {}).get("dir") or "").strip()
+    if custom:
+        return Path(os.path.expandvars(os.path.expanduser(custom)))
+    return (known_folder("документы") or Path.home() / "Documents") / "Заметки Джарвиса"
+
+
+def _note_title(text: str) -> str:
+    words = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", text).split()
+    title = " ".join(words[:6]) or "Заметка"
+    return title[:60].strip(" .")
+
+
+def _all_notes() -> List[Path]:
+    d = notes_dir()
+    if not d.is_dir():
+        return []
+    return sorted([p for p in d.iterdir() if p.suffix.lower() in (".md", ".txt")],
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _find_note(query: str) -> Optional[Path]:
+    notes = _all_notes()
+    if not notes:
+        return None
+    q = query.lower().replace("ё", "е").strip()
+    if not q:
+        return notes[0]
+    stems = [n.stem.lower().replace("ё", "е") for n in notes]
+    for n, st in zip(notes, stems):
+        if q in st:
+            return n
+    best = difflib.get_close_matches(q, stems, n=1, cutoff=0.5)
+    if best:
+        return notes[stems.index(best[0])]
+    for n in notes:
+        try:
+            if q in n.read_text(encoding="utf-8-sig", errors="replace").lower().replace("ё", "е"):
+                return n
+        except OSError:
+            continue
+    return None
+
+
+def cmd_notes(a) -> str:
+    text = " ".join(a.text).strip()
+    d = notes_dir()
+    if a.action == "add":
+        if not text:
+            raise ToolError("Нечего записать.")
+        title = _note_title(a.title or text)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{dt.date.today():%Y-%m-%d} {title}.md"
+        stamp = dt.datetime.now().strftime("%H:%M")
+        if path.exists():
+            with path.open("a", encoding="utf-8") as f:
+                f.write(f"\n\n{stamp} — {text}\n")
+            return f"Дописал в заметку «{title}». Файл: {path}"
+        path.write_text(f"# {title}\n\n{text}\n", encoding="utf-8")
+        return f"Заметка «{title}» сохранена. Файл: {path}"
+    if a.action == "list":
+        notes = _all_notes()
+        if not notes:
+            return f"Заметок пока нет. Папка: {d}"
+        return f"Заметок: {len(notes)}. Последние: " + "; ".join(n.stem for n in notes[:12]) + f". Папка: {d}"
+    if a.action == "read":
+        note = _find_note(text)
+        if note is None:
+            raise ToolError("Такой заметки не нашёл.")
+        body = note.read_text(encoding="utf-8-sig", errors="replace").strip()
+        return f"«{note.stem}»: {body[:2500]}"
+    if a.action == "search":
+        if not text:
+            raise ToolError("Что искать в заметках?")
+        q = text.lower().replace("ё", "е")
+        hits = []
+        for n in _all_notes():
+            try:
+                for line in n.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                    if q in line.lower().replace("ё", "е"):
+                        hits.append(f"{n.stem}: {line.strip()[:120]}")
+                        break
+            except OSError:
+                continue
+        return ("Нашёл: " + "; ".join(hits[:10])) if hits else "В заметках этого нет."
+    if a.action == "open":
+        target = _find_note(text) if text else d
+        if target is None:
+            raise ToolError("Такой заметки не нашёл.")
+        d.mkdir(parents=True, exist_ok=True)
+        if DRY or not IS_WIN:
+            print(f"[сухой прогон] открыть: {target}", file=sys.stderr)
+        else:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        return f"Открываю {'заметку «' + target.stem + '»' if target != d else 'папку заметок'}."
+    raise ToolError("Неизвестное действие с заметками.")
+
+
+# --------------------------------------------------------------------------
+# Папки (окна проводника)
+# --------------------------------------------------------------------------
+
+PS_EXPLORER_WINDOWS = (
+    "$t = $env:JARVIS_TARGET; $act = $env:JARVIS_ACTION; $n = 0; $sh = New-Object -ComObject Shell.Application;"
+    "foreach ($w in @($sh.Windows())) {"
+    "  try { $p = $w.Document.Folder.Self.Path } catch { continue };"
+    "  if (-not $p) { continue };"
+    "  if ($act -eq 'list') { Write-Output $p; continue };"
+    "  if ($t -eq '*' -or $p -ieq $t -or (Split-Path $p -Leaf) -ieq $t) { $w.Quit(); $n++ }"
+    "};"
+    "if ($act -ne 'list') { Write-Output $n }"
+)
+
+
+def cmd_folder(a) -> str:
+    raw = " ".join(a.target).strip()
+    if a.action == "list":
+        if DRY or not IS_WIN:
+            return "Открытых папок нет."
+        res = run_ps(PS_EXPLORER_WINDOWS, env={"JARVIS_ACTION": "list", "JARVIS_TARGET": ""})
+        paths = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+        return ("Открыты папки: " + "; ".join(paths)) if paths else "Открытых папок нет."
+    if a.action == "close":
+        target = "*" if raw.lower() in ("", "все", "всё", "all") else str(resolve_place(raw))
+        if DRY or not IS_WIN:
+            print(f"[сухой прогон] закрыть папку: {target}", file=sys.stderr)
+            return "Закрываю папку."
+        res = run_ps(PS_EXPLORER_WINDOWS, env={"JARVIS_ACTION": "close", "JARVIS_TARGET": target})
+        lines = res.stdout.strip().splitlines()
+        n = int(lines[-1].strip()) if lines and lines[-1].strip().isdigit() else 0
+        if n == 0:
+            raise ToolError("Такая папка не открыта.")
+        return f"Закрыл {n} {plural(n, 'окно', 'окна', 'окон')} проводника."
+    path = resolve_place(raw)
+    if a.action == "create":
+        if DRY:
+            print(f"[сухой прогон] создать папку: {path}", file=sys.stderr)
+            return f"Папка создана: {path}"
+        existed = path.exists()
+        path.mkdir(parents=True, exist_ok=True)
+        return f"Папка уже есть: {path}" if existed else f"Папка создана: {path}"
+    if a.action == "open":
+        if not path.exists():
+            raise ToolError(f"Папки нет: {path}")
+        if DRY or not IS_WIN:
+            print(f"[сухой прогон] открыть папку: {path}", file=sys.stderr)
+        else:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        return f"Открываю папку {path.name or path}."
+    raise ToolError("Неизвестное действие с папкой.")
+
+
+# --------------------------------------------------------------------------
+# Окна программ
+# --------------------------------------------------------------------------
+
+SKIP_WINDOWS = {"program manager", "microsoft text input application", "windows input experience", "settings"}
+SECRET_TITLE = re.compile(r"парол|password|пин-код|\bpin\b|вход в|sign.?in|log.?in|авторизац|учетн|учётн", re.I)
+
+
+def _windows(io: Any) -> List[Dict[str, Any]]:
+    return [w for w in io.windows() if w.get("title", "").strip().lower() not in SKIP_WINDOWS]
+
+
+def _find_window(io: Any, query: str) -> Dict[str, Any]:
+    wins = _windows(io)
+    q = query.lower().replace("ё", "е").strip()
+    if not q:
+        raise ToolError("Не сказано, какое окно.")
+    for w in wins:
+        proc = os.path.splitext(w.get("process", ""))[0].lower()
+        if q == proc or q in w.get("title", "").lower().replace("ё", "е"):
+            return w
+    titles = [w.get("title", "").lower() for w in wins]
+    best = difflib.get_close_matches(q, titles + [os.path.splitext(w.get("process", ""))[0].lower() for w in wins],
+                                     n=1, cutoff=0.6)
+    if best:
+        for w in wins:
+            if best[0] in (w.get("title", "").lower(), os.path.splitext(w.get("process", ""))[0].lower()):
+                return w
+    raise ToolError(f"Окно «{query}» не найдено.")
+
+
+def cmd_windows(_a) -> str:
+    io = make_input()
+    wins = _windows(io)
+    if not wins:
+        return "Открытых окон нет."
+    lines = [f"{w['title'][:70]} ({w.get('process') or '?'})" for w in wins[:25]]
+    return f"Открыто окон: {len(wins)}. " + "; ".join(lines)
+
+
+def cmd_window(a) -> str:
+    io = make_input()
+    w = _find_window(io, " ".join(a.target))
+    title = w.get("title", "")
+    if a.action == "focus":
+        io.focus(w)
+        return f"Переключился на «{title[:60]}»."
+    if DRY or not IS_WIN:
+        print(f"[сухой прогон] окно {a.action}: {title}", file=sys.stderr)
+        return f"Готово: {title[:60]}."
+    u32 = ctypes.windll.user32
+    if a.action == "close":
+        u32.PostMessageW(w["hwnd"], 0x0010, 0, 0)          # WM_CLOSE: программа сама спросит про несохранённое
+        return f"Закрываю «{title[:60]}»."
+    if a.action == "minimize":
+        u32.ShowWindow(w["hwnd"], 6)
+        return f"Свернул «{title[:60]}»."
+    if a.action == "maximize":
+        u32.ShowWindow(w["hwnd"], 3)
+        return f"Развернул «{title[:60]}»."
+    raise ToolError("Неизвестное действие с окном.")
+
+
+# --------------------------------------------------------------------------
+# Клавиатура
+# --------------------------------------------------------------------------
+
+KEY_ALIASES = {"control": "ctrl", "контрол": "ctrl", "enter": "enter", "ввод": "enter", "return": "enter",
+               "escape": "esc", "пробел": "space", "del": "delete", "windows": "win", "cmd": "win"}
+
+
+def cmd_keys(a) -> str:
+    io = make_input()
+    fg = io.foreground() or {}
+    if SECRET_TITLE.search(fg.get("title", "") or ""):
+        raise ToolError("Сейчас открыто окно входа или пароля: туда я ничего не набираю.")
+    text = " ".join(a.text)
+    if a.action == "type":
+        if not text:
+            raise ToolError("Нечего набирать.")
+        io.type_text(text)
+        return f"Набрал текст ({len(text)} симв.)."
+    combo = [KEY_ALIASES.get(k.strip().lower(), k.strip().lower()) for k in re.split(r"[+\s]+", text) if k.strip()]
+    if not combo:
+        raise ToolError("Не сказано, какие клавиши.")
+    unknown = [k for k in combo if k not in KEY_VK]
+    if unknown:
+        raise ToolError("Не знаю клавиши: " + ", ".join(unknown))
+    if len(combo) == 1:
+        io.key(combo[0])
+    else:
+        io.hotkey(combo)
+    return "Нажал " + "+".join(combo) + "."
+
+
+# --------------------------------------------------------------------------
+# Интернет: поиск и чтение страниц
+# --------------------------------------------------------------------------
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _fetch(url: str, timeout: float = 12.0, limit: int = 2_000_000) -> Tuple[str, str]:
+    """(текст ответа, итоговый адрес). Кодировка — из заголовка или meta."""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept-Language": "ru,en;q=0.8",
+                                               "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(limit)
+            charset = resp.headers.get_content_charset() or ""
+            final = resp.geturl()
+    except urllib.error.HTTPError as exc:
+        raise ToolError(f"Сайт ответил ошибкой {exc.code}.") from None
+    except (urllib.error.URLError, OSError) as exc:
+        raise ToolError("Нет связи с сайтом. Проверьте интернет.") from exc
+    if not charset:
+        m = re.search(rb"<meta[^>]+charset=[\"']?([\w-]+)", raw[:4000], re.I)
+        charset = m.group(1).decode("ascii", "replace") if m else "utf-8"
+    try:
+        return raw.decode(charset, "replace"), final
+    except LookupError:
+        return raw.decode("utf-8", "replace"), final
+
+
+def _clean(fragment: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(TAG_RE.sub(" ", fragment))).strip()
+
+
+def parse_ddg(page: str) -> List[Dict[str, str]]:
+    out = []
+    starts = list(re.finditer(r'<div[^>]+class="([^"]*\bresult\b[^"]*)"', page))
+    for i, m0 in enumerate(starts):
+        if "result--ad" in m0.group(1):
+            continue                                  # реклама
+        block = page[m0.end():starts[i + 1].start() if i + 1 < len(starts) else len(page)]
+        m = re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        href = html.unescape(m.group(1))
+        if "uddg=" in href:
+            href = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [href])[0])
+        if href.startswith("//"):
+            href = "https:" + href
+        sn = re.search(r'class="result__snippet"[^>]*>(.*?)</(?:a|div)>', block, re.S)
+        out.append({"title": _clean(m.group(2)), "url": href, "snippet": _clean(sn.group(1)) if sn else ""})
+    return out
+
+
+def parse_bing(page: str) -> List[Dict[str, str]]:
+    out = []
+    for block in page.split('<li class="b_algo"')[1:]:
+        m = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        sn = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        out.append({"title": _clean(m.group(2)), "url": html.unescape(m.group(1)), "snippet": _clean(sn.group(1)) if sn else ""})
+    return out
+
+
+def web_search(query: str) -> List[Dict[str, str]]:
+    q = urllib.parse.quote_plus(query)
+    errors = []
+    for url, parse in ((f"https://html.duckduckgo.com/html/?q={q}&kl=ru-ru", parse_ddg),
+                       (f"https://www.bing.com/search?q={q}&setlang=ru", parse_bing)):
+        try:
+            page, _ = _fetch(url)
+            found = parse(page)
+            if found:
+                return found
+        except ToolError as exc:
+            errors.append(str(exc))
+    if errors and len(errors) == 2:
+        raise ToolError(errors[0])
+    return []
+
+
+def page_text(page: str) -> Tuple[str, str]:
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+    title = _clean(title_m.group(1)) if title_m else ""
+    body = re.sub(r"<(script|style|noscript|svg|nav|footer|header|form)\b.*?</\1>", " ", page, flags=re.S | re.I)
+    body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
+    body = re.sub(r"</(p|div|li|h\d|tr|br)>", "\n", body, flags=re.I)
+    text = html.unescape(TAG_RE.sub(" ", body))
+    lines = [re.sub(r"[ \t]+", " ", l).strip() for l in text.splitlines()]
+    lines = [l for l in lines if len(l) > 30]
+    return title, "\n".join(lines)
+
+
+def cmd_web(a) -> str:
+    text = " ".join(a.query).strip()
+    if not text:
+        raise ToolError("Не сказано, что искать.")
+    if a.action == "search":
+        if DRY:
+            return f"[сухой прогон] поиск: {text}"
+        results = web_search(text)
+        if not results:
+            return "Поиск ничего не нашёл."
+        return "\n".join(f"{i}. {r['title']} — {r['url']}\n   {r['snippet'][:220]}" for i, r in enumerate(results[:6], 1))
+    if a.action == "read":
+        url = text if re.match(r"https?://", text) else "https://" + text
+        if DRY:
+            return f"[сухой прогон] чтение: {url}"
+        page, final = _fetch(url)
+        title, body = page_text(page)
+        if not body:
+            return f"«{title or final}»: на странице нет текста (возможно, она строится скриптами)."
+        return f"«{title or final}» ({final}):\n{body[:3500]}"
+    if a.action == "open":
+        url = text if re.match(r"https?://", text) else "https://www.google.com/search?q=" + urllib.parse.quote_plus(text)
+        if DRY or not IS_WIN:
+            print(f"[сухой прогон] открыть: {url}", file=sys.stderr)
+        else:
+            os.startfile(url)  # type: ignore[attr-defined]
+        return "Открываю в браузере."
+    raise ToolError("Неизвестное действие.")
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -1504,6 +2005,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Уведомления
     nt = sub.add_parser("notify"); nt.add_argument("text", nargs="+"); nt.set_defaults(func=cmd_notify)
+
+    # Заметки
+    no = sub.add_parser("notes")
+    no.add_argument("action", choices=["add", "list", "read", "search", "open"])
+    no.add_argument("text", nargs="*")
+    no.add_argument("--title", default="")
+    no.set_defaults(func=cmd_notes)
+
+    # Папки
+    fo = sub.add_parser("folder")
+    fo.add_argument("action", choices=["open", "close", "create", "list"])
+    fo.add_argument("target", nargs="*")
+    fo.set_defaults(func=cmd_folder)
+
+    # Окна
+    sub.add_parser("windows").set_defaults(func=cmd_windows)
+    wi = sub.add_parser("window")
+    wi.add_argument("action", choices=["close", "focus", "minimize", "maximize"])
+    wi.add_argument("target", nargs="+")
+    wi.set_defaults(func=cmd_window)
+
+    # Клавиатура
+    ky = sub.add_parser("keys")
+    ky.add_argument("action", choices=["type", "press"])
+    ky.add_argument("text", nargs="+")
+    ky.set_defaults(func=cmd_keys)
+
+    # Интернет
+    wb = sub.add_parser("web")
+    wb.add_argument("action", choices=["search", "read", "open"])
+    wb.add_argument("query", nargs="+")
+    wb.set_defaults(func=cmd_web)
+
+    # Программы из меню «Пуск»
+    ap = sub.add_parser("apps"); ap.add_argument("query", nargs="*"); ap.set_defaults(func=cmd_apps)
 
     return p
 

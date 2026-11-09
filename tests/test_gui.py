@@ -63,7 +63,7 @@ class GuiBase(unittest.TestCase):
 class WindowTests(GuiBase):
     def test_every_page_opens(self):
         titles = [p.title for p in self.w.pages]
-        self.assertEqual(titles, ["Главное", "Задачи", "Голос", "Слух", "Возможности", "Подключения", "Диагностика", "Система"])
+        self.assertEqual(titles, ["Главное", "Задачи", "Telegram", "Голос", "Слух", "Возможности", "Подключения", "Диагностика", "Система"])
         for t in titles:
             page(self.w, t)
 
@@ -298,18 +298,28 @@ class VoiceHearingAbilitiesTests(GuiBase):
 
 
 class TelegramChatLogSystemTests(GuiBase):
-    def test_telegram_save(self):
-        p = page(self.w, "Подключения")
-        p.token.setText("123:ABC")
-        p.users.setText("111, 222")
+    def test_telegram_page(self):
+        from jarvis import telegram
+        old = telegram.API
+        telegram.API = "http://127.0.0.1:9"            # без настоящего Telegram: соединение сразу отклоняется
+        self.addCleanup(setattr, telegram, "API", old)
+        self.addCleanup(self.ctx.service.stop_telegram)
+        p = page(self.w, "Telegram")
+        p.token.setText("не токен")
         p.tg_save.click()
-        env = backend.read_env_file(backend.hermes_home() / ".env")
-        self.assertEqual((env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_ALLOWED_USERS"]), ("123:ABC", "111,222"))
+        self.assertIn("не похоже", p.tg_state.text())
+        p.token.setText("123456789:AAHfakefakefakefakefakefakefakefake1")
+        p.tg_save.click()
+        self.assertEqual(telegram.load_config()["token"], "123456789:AAHfakefakefakefakefakefakefakefake1")
         self.assertEqual(p.token.text(), "")
-        self.assertIn("Ключ сохранён", p.token_state.text())
-        p.users.setText("не цифры")
-        p.tg_save.click()
-        self.assertIn("цифры", p.tg_status.text())
+        self.assertIn("…ake1", p.token_state.text())
+        self.assertTrue(wait_for(lambda: self.ctx.service.telegram is not None and
+                                 self.ctx.service.telegram.state == "offline", 10))
+        self.assertTrue(wait_for(lambda: "Нет связи" in p.tg_state.text(), 5))
+        self.assertRegex(p.code.text(), r"^\d{6}$")
+        p.tg_enabled.setChecked(False)
+        self.assertTrue(wait_for(lambda: self.ctx.service.telegram is None, 5))
+        self.assertFalse(telegram.load_config()["enabled"])
 
     def test_home_text_command_roundtrip_through_hermes(self):
         p = page(self.w, "Главное")

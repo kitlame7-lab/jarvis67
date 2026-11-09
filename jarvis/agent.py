@@ -22,7 +22,7 @@ log = logging.getLogger("jarvis")
 
 MAX_STEPS = 5
 MAX_ACTIONS_PER_STEP = 3
-RESULT_LIMIT = 1500
+RESULT_LIMIT = 2500
 TOOL_TIMEOUT_S = 40.0
 
 # Что умеет jarvis-pc. Это единственный список, который видит модель; тест сверяет его с pc.py.
@@ -57,6 +57,18 @@ CATALOG: List[Tuple[str, str]] = [
     ("run <команда>", "выполнить команду Windows"),
     ("notify <текст>", "показать уведомление"),
     ("task list|run|show|delete <название>", "записанные пользователем задачи"),
+    ("notes add <текст> [--title заголовок]", "записать заметку в папку заметок"),
+    ("notes list|read|search|open [что]", "заметки: список, прочитать, найти, открыть"),
+    ("folder open|close|create <путь или имя>", "папки: рабочий стол, загрузки, документы или любой путь"),
+    ("folder list", "какие папки открыты в проводнике"),
+    ("windows", "какие окна программ открыты сейчас"),
+    ("window close|focus|minimize|maximize <название>", "управлять окном программы"),
+    ("keys type <текст>", "набрать текст в активном окне"),
+    ("keys press <сочетание>", "нажать клавиши, например ctrl+s, enter, alt+tab"),
+    ("web search <запрос>", "найти в интернете (заголовки, адреса, кратко)"),
+    ("web read <адрес>", "прочитать текст страницы"),
+    ("web open <запрос или адрес>", "открыть в браузере"),
+    ("apps [название]", "установленные программы (меню «Пуск»)"),
 ]
 COMMANDS = {line.split()[0] for line, _ in CATALOG}
 
@@ -70,6 +82,9 @@ SYSTEM = (
     "(до трёх строк, ничего больше). Ты получишь РЕЗУЛЬТАТ и тогда ответишь человеку словами. "
     "Если действие не нужно (вопрос, расчёт, разговор), просто ответь.\n\n"
     "Команды:\n{commands}\n\n"
+    "Ты видишь компьютер через команды: windows — открытые окна, files — файлы, processes — программы, sysinfo — "
+    "состояние. Свежие факты (новости, цены, расписания) ищи через web search, затем при необходимости web read, "
+    "и отвечай по найденному. Несколько независимых действий можно отправить сразу, до трёх строк.\n"
     "Правила: не выдумывай результат, пересказывай то, что вернула команда; если команда не удалась, скажи прямо. "
     "Опасное (удаление, завершение процессов, выключение) делай, только когда об этом просили прямо. "
     "Пути с пробелами бери в кавычки."
@@ -79,11 +94,17 @@ MONTHS = ["января", "февраля", "марта", "апреля", "ма�
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 
-def system_prompt(name: str, address: str, now: Optional[time.struct_time] = None) -> str:
+def system_prompt(name: str, address: str, now: Optional[time.struct_time] = None,
+                  extra: Optional[List[Tuple[str, str]]] = None, channel: str = "voice") -> str:
     t = now or time.localtime()
     stamp = f"{WEEKDAYS[t.tm_wday]}, {t.tm_mday} {MONTHS[t.tm_mon - 1]} {t.tm_year}, {t.tm_hour:02d}:{t.tm_min:02d}"
-    cmds = "\n".join(f"- {line} — {what}" for line, what in CATALOG)
-    return SYSTEM.format(name=name, address=address, now=stamp, commands=cmds)
+    cmds = "\n".join(f"- {line} — {what}" for line, what in CATALOG + list(extra or []))
+    text = SYSTEM.format(name=name, address=address, now=stamp, commands=cmds)
+    if channel == "telegram":
+        text = text.replace("Ответ зачитывается вслух: одна-три короткие фразы, без разметки, списков, эмодзи и ссылок.",
+                            "Человек пишет из Telegram, ты на его компьютере. Отвечай коротко и по делу; простые списки "
+                            "и ссылки допустимы, Markdown не используй.")
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -122,11 +143,13 @@ def _protected_path(path: str) -> bool:
     return any(p == base or p.startswith(base + "\\") for base in PROTECTED_PATHS)
 
 
-def check_allowed(tokens: List[str]) -> Optional[str]:
+def check_allowed(tokens: List[str], extra: Optional[Any] = None) -> Optional[str]:
     """Причина отказа или None. Это страховка от ошибки модели, а не замена здравому смыслу пользователя."""
     if not tokens:
         return "пустая команда"
     cmd = tokens[0]
+    if extra and cmd in extra:
+        return None
     if cmd not in COMMANDS:
         return f"неизвестная команда «{cmd}»"
     rest = " ".join(tokens[1:])
@@ -164,32 +187,82 @@ class Answer:
     llm_s: float = 0.0
     tools_s: float = 0.0
     actions: List[str] = field(default_factory=list)
+    results: List[Tuple[str, bool, str]] = field(default_factory=list)   # (команда, успех, вывод)
+    spoken: bool = False          # часть ответа уже ушла в озвучку по мере написания
+    cancelled: bool = False
+
+
+@dataclass
+class Tool:
+    """Команда, которую выполняет сам Джарвис (а не jarvis-pc): отправка файла в Telegram, шаблоны рутин."""
+    usage: str
+    what: str
+    run: Callable[[List[str]], Tuple[bool, str]]
 
 
 class Agent:
     def __init__(self, cfg: Dict[str, Any], endpoint: llm.Endpoint,
                  runner: Callable[[List[str]], Tuple[bool, str]] = run_pc,
-                 chat: Callable[..., str] = llm.chat):
-        self.cfg, self.endpoint, self.runner, self.chat = cfg, endpoint, runner, chat
+                 chat: Callable[..., str] = llm.chat,
+                 stream: Optional[Callable[..., Any]] = llm.stream_chat):
+        self.cfg, self.endpoint, self.runner, self.chat, self.stream = cfg, endpoint, runner, chat, stream
         eng = cfg.get("engine", {})
         self.timeout = float(eng.get("llm_timeout_s", 40))
         self.max_steps = int(eng.get("max_steps", MAX_STEPS))
 
+    def _streamed(self, msgs: List[Dict[str, str]], cancel: Any, on_text: Callable[[str], None]) -> Tuple[str, bool]:
+        from .speech import StreamSplitter
+        splitter = StreamSplitter()
+        parts: List[str] = []
+        spoke = False
+        for piece in self.stream(self.endpoint, msgs, timeout=self.timeout, cancel=cancel):
+            if cancel is not None and cancel.is_set():
+                break
+            parts.append(piece)
+            for sentence in splitter.feed(piece):
+                spoke = True
+                on_text(sentence)
+        if not (cancel is not None and cancel.is_set()):
+            for sentence in splitter.flush():
+                spoke = True
+                on_text(sentence)
+        return "".join(parts), spoke
+
     def ask(self, command: str, history: Optional[List[Tuple[str, str]]] = None,
-            cancel: Optional[Any] = None) -> Answer:
-        msgs: List[Dict[str, str]] = [{"role": "system", "content": system_prompt(self.cfg["name"], self.cfg["address"])}]
+            cancel: Optional[Any] = None, on_text: Optional[Callable[[str], None]] = None,
+            on_action: Optional[Callable[[str], None]] = None, tools: Optional[Dict[str, Tool]] = None,
+            channel: str = "voice", max_steps: Optional[int] = None) -> Answer:
+        """Отвечает на просьбу. on_text получает готовые предложения по мере написания (для озвучки сразу),
+        on_action — каждую выполняемую команду (для «выполняю…» в Telegram)."""
+        tools = tools or {}
+        extra = [(t.usage, t.what) for t in tools.values()]
+        msgs: List[Dict[str, str]] = [{"role": "system", "content": system_prompt(
+            self.cfg["name"], self.cfg["address"], extra=extra, channel=channel)}]
         for user, reply in (history or [])[-6:]:
             msgs += [{"role": "user", "content": user}, {"role": "assistant", "content": reply[:300]}]
         msgs.append({"role": "user", "content": command})
         out = Answer("")
         last_results = ""
-        for step in range(1, self.max_steps + 1):
+        spoken_parts: List[str] = []
+        for step in range(1, (max_steps or self.max_steps) + 1):
             if cancel is not None and cancel.is_set():
+                out.cancelled = True
                 break
             t0 = time.monotonic()
-            reply = self.chat(self.endpoint, msgs, timeout=self.timeout)
+            if on_text is not None and self.stream is not None:
+                def speak(sentence: str) -> None:
+                    spoken_parts.append(sentence)
+                    on_text(sentence)
+                reply, spoke = self._streamed(msgs, cancel, speak)
+                out.spoken = out.spoken or spoke
+            else:
+                reply = self.chat(self.endpoint, msgs, timeout=self.timeout)
             out.llm_s += time.monotonic() - t0
             out.steps = step
+            if cancel is not None and cancel.is_set():
+                out.cancelled = True
+                out.text = " ".join(spoken_parts)
+                return out
             actions, text = parse_actions(reply)
             if not actions:
                 out.text = text or reply.strip()
@@ -197,20 +270,31 @@ class Agent:
             results = []
             for line in actions[:MAX_ACTIONS_PER_STEP]:
                 tokens = split_args(line)
-                refusal = check_allowed(tokens)
+                refusal = check_allowed(tokens, tools)
+                if on_action is not None and not refusal:
+                    on_action(line)
                 if refusal:
                     ok, res = False, refusal
                 else:
                     t1 = time.monotonic()
-                    ok, res = self.runner(tokens)
+                    try:
+                        ok, res = tools[tokens[0]].run(tokens[1:]) if tokens[0] in tools else self.runner(tokens)
+                    except Exception as exc:  # noqa: BLE001 — сбой команды пересказываем модели, а не роняем ответ
+                        log.exception("Сбой команды %s", line)
+                        ok, res = False, f"сбой: {exc}"
                     out.tools_s += time.monotonic() - t1
                 out.actions.append(line)
+                out.results.append((line, ok, res))
                 results.append(f"{line} -> {'' if ok else 'ОШИБКА: '}{res[:RESULT_LIMIT]}")
                 log.info("Команда: %s -> %s", line, ("ok" if ok else "ошибка") + ": " + res[:120].replace("\n", " "))
             last_results = "\n".join(results)
             msgs.append({"role": "assistant", "content": reply})
             msgs.append({"role": "user", "content": "РЕЗУЛЬТАТ:\n" + last_results +
-                         "\nТеперь ответь человеку словами, без строк ДЕЙСТВИЕ, если больше ничего делать не нужно."})
+                         "\nЕсли нужно ещё действие — снова строки ДЕЙСТВИЕ. Если всё сделано — ответь человеку "
+                         "словами, коротко, без строк ДЕЙСТВИЕ и не повторяя уже сказанное."})
+        if out.cancelled:
+            out.text = " ".join(spoken_parts)
+            return out
         out.text = ("Сделал, но не смог подвести итог: " + last_results.split("->", 1)[-1].strip()[:200]) if last_results \
             else "Не успел обдумать ответ."
         return out

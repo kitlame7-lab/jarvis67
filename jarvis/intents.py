@@ -36,12 +36,14 @@ def _fold(patterns):
 START, STOP, CANCEL = _fold(START), _fold(STOP), _fold(CANCEL)
 RUN_TASK = re.compile(r"\b(?:выполни|запусти|повтори|проиграй|сделай|включи)(?:те)?\s+(?:мою\s+|эту\s+|записанную\s+)?"
                       r"(?:задачу|задание)\s+(.+)$")
+RUN_ROUTINE = re.compile(r"\b(?:выполни|запусти|сделай|проиграй|включи)(?:те)?\s+(?:мой\s+|мою\s+|свой\s+)?"
+                         r"(?:шаблон|рутину|сценарий|распорядок)\s+(.+)$")
 NAME = re.compile(r"(?:назови(?:те)?(?: (?:её|ее|это|задачу|запись))?|называется|под названием|назван(?:ие)?)\s+(.+)$")
 
 
 @dataclass
 class Intent:
-    kind: str                # teach_start | teach_stop | teach_cancel | task_run
+    kind: str                # teach_start | teach_stop | teach_cancel | task_run | routine_run
     arg: str = ""            # название задачи, если его назвали
 
 
@@ -63,6 +65,9 @@ def parse(text: str, recording: bool = False) -> Optional[Intent]:
         return None
     if any(p.search(low) for p in START):
         return Intent("teach_start", name)
+    routine = RUN_ROUTINE.search(raw)
+    if routine:
+        return Intent("routine_run", re.sub(r"\s+пожалуйста$", "", routine.group(1).strip()))
     run = RUN_TASK.search(raw)
     if run:
         return Intent("task_run", re.sub(r"\s+пожалуйста$", "", run.group(1).strip()))

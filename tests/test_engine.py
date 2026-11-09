@@ -221,7 +221,7 @@ class AgentTests(unittest.TestCase):
         stop.set()
         out = ag.ask("привет", cancel=stop)
         self.assertEqual(self.sent, [])
-        self.assertTrue(out.text)
+        self.assertTrue(out.cancelled)
 
     def test_history_is_included(self):
         ag = self.make(["Да."])
@@ -321,7 +321,7 @@ class AssistantEngineTests(unittest.TestCase):
         gate = threading.Event()
         calls = []
 
-        def ask(command, history, cancel):
+        def ask(command, history, cancel, **kw):
             calls.append(command)
             if command == "зависни":
                 gate.wait(10)
@@ -341,7 +341,7 @@ class AssistantEngineTests(unittest.TestCase):
         a = self.make()
         gate = threading.Event()
         a.agent = mock.Mock()
-        a.agent.ask.side_effect = lambda c, h, cancel: gate.wait(10) or agent.Answer("поздно")
+        a.agent.ask.side_effect = lambda c, h, cancel, **kw: (gate.wait(10), agent.Answer("поздно"))[1]
         result = []
         t = threading.Thread(target=lambda: result.append(a.answer("долгий вопрос")), daemon=True)
         t.start()
@@ -359,7 +359,7 @@ class AssistantEngineTests(unittest.TestCase):
     def test_ack_is_spoken_when_answer_is_slow(self):
         a = self.make()
         a.agent = mock.Mock()
-        a.agent.ask.side_effect = lambda c, h, cancel: time.sleep(0.8) or agent.Answer("Вот.")
+        a.agent.ask.side_effect = lambda c, h, cancel, **kw: time.sleep(0.8) or agent.Answer("Вот.")
         a.answer("подумай")
         self.assertEqual(self.sp.said[0], "Одну секунду, сэр.")
         self.assertEqual(self.sp.said[-1], "Вот.")

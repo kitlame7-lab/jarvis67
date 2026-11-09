@@ -10,7 +10,7 @@ a = Analysis(  # noqa: F821
     datas=[(str(ROOT / "jarvis" / "resources" / "jarvis-pc" / "scripts" / "pc.py"),
             "jarvis/resources/jarvis-pc/scripts")],
     # pc.py подгружается как файл, поэтому его библиотеки перечисляем сами
-    hiddenimports=["__future__", "argparse", "csv", "ctypes", "ctypes.wintypes", "datetime", "difflib", "io", "json", "os",
+    hiddenimports=["__future__", "argparse", "csv", "ctypes", "ctypes.wintypes", "datetime", "difflib", "html", "html.entities", "io", "json", "os",
                    "pathlib", "re", "shutil", "socket", "subprocess", "sys", "time", "typing", "urllib.error",
                    "urllib.parse", "urllib.request", "winreg", "xml.etree.ElementTree"],
     excludes=["tkinter", "numpy", "PySide6"],

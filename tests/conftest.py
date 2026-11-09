@@ -24,3 +24,17 @@ def clean_state():
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
     yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Фоновые потоки Джарвиса (речь, ходы разговора, бот) должны закончиться до выхода интерпретатора:
+    поток, пишущий в журнал во время завершения Python, может уронить процесс («Fatal Python error»)."""
+    import logging
+    import threading
+    import time
+    end = time.monotonic() + 10
+    for th in threading.enumerate():
+        if th is not threading.current_thread() and th.name.startswith("jarvis"):
+            th.join(max(0.0, end - time.monotonic()))
+    logging.getLogger("jarvis").handlers.clear()
+    logging.getLogger("jarvis").propagate = False

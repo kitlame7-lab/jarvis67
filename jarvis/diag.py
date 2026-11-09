@@ -266,6 +266,13 @@ def _log_tail(lines: int = 120) -> List[str]:
     return raw.splitlines()[-lines:]
 
 
+def _telegram_summary() -> Dict[str, Any]:
+    """Без токена: только есть ли он, включён ли бот и сколько людей привязано."""
+    from . import telegram
+    cfg = telegram.load_config()
+    return {"token": bool(cfg.get("token")), "enabled": bool(cfg.get("enabled", True)), "allowed": len(cfg["allowed"])}
+
+
 def gather(service_state: tuple = ("", ""), net: bool = True, hermes_probe: bool = True,
            network: Optional[Callable[[Dict[str, str]], Dict[str, Dict[str, Any]]]] = None) -> Dict[str, Any]:
     """Собирает всё, что нужно для выводов. Тяжёлое (сеть, Hermes) запускайте не в потоке окна."""
@@ -301,6 +308,7 @@ def gather(service_state: tuple = ("", ""), net: bool = True, hermes_probe: bool
         "hermes": {"exe": exe, "version": _hermes_version(exe) if (exe and hermes_probe) else "",
                    "provider": now.get("provider", ""), "model": now.get("model", ""),
                    "base_url": safe_url(now.get("base_url", ""))},
+        "telegram": _telegram_summary(),
         "engine": {"mode": str(cfg.get("engine", {}).get("mode", "auto")),
                    "native": llm.resolve_endpoint(cfg) is not None,
                    "timings": [{"source": src, "seconds": round(sec, 1), "ok": ok} for _, src, sec, ok in list(TIMINGS)[-20:]]},
@@ -398,6 +406,13 @@ def analyze(data: Dict[str, Any]) -> List[Finding]:
     if srv is not None and not srv["ok"]:
         out.append(Finding("error", "Сервер модели ответов недоступен", f"{srv.get('url', '')}: {srv.get('error', '')}",
                            "Проверьте адрес (Base URL) и интернет. Сайт-поставщик ключа может быть временно недоступен."))
+
+    # --- Telegram
+    tg = data.get("telegram") or {}
+    if tg.get("token") and tg.get("enabled") and not tg.get("allowed"):
+        out.append(Finding("info", "Telegram-бот не привязан",
+                           "Бот настроен, но ещё никто не отправил ему код привязки.",
+                           "Откройте раздел «Telegram» и отправьте боту показанный там код."))
 
     # --- скорость ответов
     eng = data.get("engine") or {}

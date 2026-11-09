@@ -1,3 +1,3 @@
 """Джарвис — голосовой ассистент для Windows на базе Hermes Agent."""
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 REPO = "kitlame7-lab/jarvis67"

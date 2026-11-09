@@ -166,3 +166,48 @@ class ThemeTests(GuiBase):
     def test_every_palette_defines_the_same_colors(self):
         from jarvis.gui import theme
         self.assertEqual(set(theme.PALETTES["light"]), set(theme.PALETTES["dark"]))
+
+
+class RoutinesAndSettingsTests(GuiBase):
+    def setUp(self):
+        super().setUp()
+        from jarvis import routines
+        for r in routines.load_all():
+            r.path.unlink()
+
+    def test_routine_editor_roundtrip(self):
+        from jarvis import routines
+        p = page(self.w, "Задачи")
+        p.r_save.click()
+        self.assertIn("Нужны", p.r_status.text())
+        p.r_name.setText("Утро")
+        p.r_text.setPlainText("- скажи погоду\n- открой почту")
+        p.r_save.click()
+        self.assertIn("шагов 2", p.r_status.text())
+        self.assertEqual([r.name for r in routines.load_all()], ["Утро"])
+        self.assertEqual(p.r_pick.count(), 2)
+        # переименование не оставляет старый файл
+        p.r_name.setText("Утро рабочее")
+        p.r_save.click()
+        self.assertEqual(sorted(r.path.stem for r in routines.load_all()), ["Утро рабочее"])
+        p.r_run.click()
+        self.assertTrue(wait_for(lambda: "Выполняю" in p.r_status.text()))
+        p.r_del.click()
+        self.assertEqual(routines.load_all(), [])
+
+    def test_hearing_barge_in_saved(self):
+        from jarvis.core import load_settings
+        p = page(self.w, "Слух")
+        self.assertEqual(p.barge.currentData(), "voice")
+        p.barge.setCurrentIndex(p.barge.findData("wake"))
+        p.tail.setCurrentIndex(p.tail.findData(900))
+        p.btn_save.click()
+        audio = load_settings()["audio"]
+        self.assertEqual((audio["barge_in"], audio["silence_tail_ms"]), ("wake", 900))
+
+    def test_notes_folder_saved(self):
+        from jarvis.core import load_settings
+        p = page(self.w, "Возможности")
+        p.notes_dir.setText("D:\\Заметки")
+        p.btn_save.click()
+        self.assertEqual(load_settings()["notes"]["dir"], "D:\\Заметки")

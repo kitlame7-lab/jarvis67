@@ -1,4 +1,4 @@
-"""Страницы: Telegram (часть «Подключений»), Журнал, Система."""
+"""Страницы: Telegram, Журнал, Система."""
 from __future__ import annotations
 
 import html
@@ -7,11 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QWidget)
 
-from .. import REPO, __version__, backend, core, paths
+from .. import REPO, __version__, backend, core, paths, telegram
 from . import theme
 from .common import Card, Page, SecretEdit, Status, background, field, note
 from .pages import button, primary
@@ -32,63 +32,130 @@ def open_folder(path: Path) -> None:
 # --------------------------------------------------------------------------
 
 class TelegramPage(Page):
-    """Часть страницы «Подключения»: Telegram-бот, через которого можно писать Джарвису с телефона."""
+    """Свой бот Джарвиса: задания с телефона выполняются на этом компьютере."""
+    title = "Telegram"
+    lead = ("Пишите или отправляйте голосовые своему боту — Джарвис выполнит задание на этом компьютере и пришлёт "
+            "результат: текст, снимок экрана, файл. Работает, пока Джарвис запущен, даже если микрофон выключен.")
 
     def build(self) -> None:
-        card = Card("Telegram: писать Джарвису с телефона",
-                    "Бот отвечает так же, как на голос. Работает через шлюз Hermes, который запускается отдельно.")
-        self.token = SecretEdit("123456:ABC…")
-        card.add(field("Токен бота", self.token, "Создайте бота у @BotFather в Telegram командой /newbot и скопируйте токен."))
-        self.token_state = note("")
-        card.add(self.token_state)
-        self.users = QLineEdit()
-        self.users.setPlaceholderText("123456789, 987654321")
-        card.add(field("Кому можно писать боту (числовые ID через запятую)", self.users,
-                       "Свой ID покажет бот @userinfobot. Без списка бот никому не отвечает, это защита от чужих."))
-        self.col.addWidget(card)
+        state = Card("Состояние")
+        self.tg_state = Status()
+        state.add(self.tg_state)
+        self.tg_enabled = QCheckBox("Бот включён")
+        self.tg_voice = QCheckBox("Отвечать ещё и голосом (mp3)")
+        state.row(self.tg_enabled, self.tg_voice)
+        self.tg_stop_gw = button("Остановить шлюз Hermes")
+        self.tg_stop_gw.hide()
+        state.add(self.tg_stop_gw)
+        self.col.addWidget(state)
 
-        act = Card()
-        self.tg_save = button("Сохранить")
-        self.tg_apply = primary("Сохранить и перезапустить шлюз")
-        act.row(self.tg_save, self.tg_apply)
-        self.tg_status = Status()
-        act.add(self.tg_status)
-        self.tg_out = QPlainTextEdit()
-        self.tg_out.setReadOnly(True)
-        self.tg_out.setMaximumHeight(160)
-        self.tg_out.hide()
-        act.add(self.tg_out)
-        self.col.addWidget(act)
-        self.tg_save.clicked.connect(lambda: self.save_tg(False))
-        self.tg_apply.clicked.connect(lambda: self.save_tg(True))
+        setup = Card("1. Бот", "В Telegram откройте @BotFather, отправьте /newbot, придумайте имя — он пришлёт токен.")
+        self.token = SecretEdit("123456789:AA…")
+        setup.add(field("Токен бота", self.token))
+        self.token_state = note("")
+        setup.add(self.token_state)
+        self.tg_save = primary("Сохранить и подключить")
+        setup.row(self.tg_save)
+        self.col.addWidget(setup)
+
+        pair = Card("2. Привязка", "Отправьте боту этот код — после этого он будет слушаться только вас.")
+        self.code = QLabel("——————")
+        self.code.setObjectName("bigCode")
+        self.code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.code.setStyleSheet(f"font-size: 30px; font-weight: 600; letter-spacing: 6px; color: {theme.TEXT};")
+        pair.add(self.code)
+        self.new_code = button("Новый код")
+        pair.row(self.new_code)
+        self.users = note("")
+        pair.add(self.users)
+        self.forget = button("Отвязать всех")
+        pair.row(self.forget)
+        self.col.addWidget(pair)
+
+        tips = Card("Что можно писать")
+        tips.add(note("«Открой загрузки и пришли список файлов», «Найди в интернете, сколько стоит RTX 5070», "
+                      "«Пришли файл отчёт.docx с рабочего стола», «Запиши заметку: позвонить маме», "
+                      "голосовое сообщение. Команды: /screen — снимок экрана, /status, /stop, /tasks, /run шаблон."))
+        self.col.addWidget(tips)
+
+        self.tg_save.clicked.connect(self.save_tg)
+        self.new_code.clicked.connect(self.make_code)
+        self.forget.clicked.connect(self.unlink)
+        self.tg_enabled.toggled.connect(self.toggle)
+        self.tg_voice.toggled.connect(lambda on: telegram.save_config(voice_reply=bool(on)))
+        self.tg_stop_gw.clicked.connect(self.stop_gateway)
+        self.ctx.telegram_changed.connect(self.refresh)
 
     def load(self) -> None:
-        snap = backend.hermes_snapshot()
-        self.token_state.setText(self.token.describe(snap["telegram"]["token"]))
-        self.users.setText(snap["telegram"]["users"])
+        cfg = telegram.load_config()
+        for box, value in ((self.tg_enabled, cfg.get("enabled", True)), (self.tg_voice, cfg.get("voice_reply", False))):
+            box.blockSignals(True)
+            box.setChecked(bool(value))
+            box.blockSignals(False)
+        self.token_state.setText(f"Сохранён токен {telegram.mask_token(cfg['token'])}" if cfg["token"]
+                                 else "Токен ещё не вставлен.")
+        self.users.setText(("Привязаны: " + ", ".join(str(u) for u in cfg["allowed"])) if cfg["allowed"]
+                           else "Пока никто не привязан.")
+        self.refresh()
 
-    def save_tg(self, restart: bool) -> None:
-        try:
-            backend.save_telegram(self.token.value(), self.users.text())
-        except ValueError as exc:
-            self.tg_status.bad(str(exc))
+    def refresh(self) -> None:
+        bot = self.ctx.service.telegram
+        if bot is None:
+            self.tg_state.info("Бот не запущен.")
+            self.code.setText("——————")
             return
-        self.token.clear()
+        self.code.setText(bot.pair_code)
+        show = {"ok": self.tg_state.ok, "conflict": self.tg_state.warn, "starting": self.tg_state.info,
+                "offline": self.tg_state.warn, "bad_token": self.tg_state.bad, "no_token": self.tg_state.info,
+                "off": self.tg_state.info}.get(bot.state, self.tg_state.info)
+        show(bot.status)
+        self.tg_stop_gw.setVisible(bot.state == "conflict")
+
+    def save_tg(self) -> None:
+        value = self.token.value()
+        if value:
+            value = value.strip()
+            if not telegram.TOKEN_RE.match(value):
+                self.tg_state.bad("Это не похоже на токен бота: он выглядит как 123456789:AAH…")
+                return
+            telegram.save_config(token=value, enabled=True)
+            self.token.clear()
+        self.restart_bot()
         self.load()
-        if not restart:
-            self.tg_status.ok("Сохранено. Чтобы бот заработал, перезапустите шлюз.")
-            return
-        self.tg_apply.setEnabled(False)
-        self.tg_out.clear()
-        self.tg_out.show()
-        self.tg_status.info("Перезапускаю шлюз…")
+
+    def restart_bot(self) -> None:
+        background(self.ctx.bus, self.ctx.service.start_telegram, lambda _r, _e: self.refresh())
+
+    def toggle(self, on: bool) -> None:
+        telegram.save_config(enabled=bool(on))
+        if on:
+            self.restart_bot()
+        else:
+            background(self.ctx.bus, self.ctx.service.stop_telegram, lambda _r, _e: self.refresh())
+
+    def make_code(self) -> None:
+        bot = self.ctx.service.telegram
+        if bot is not None:
+            self.code.setText(bot.new_code())
+
+    def unlink(self) -> None:
+        telegram.save_config(allowed=[])
+        bot = self.ctx.service.telegram
+        if bot is not None:
+            bot.cfg = telegram.load_config()
+        self.load()
+
+    def stop_gateway(self) -> None:
+        self.tg_state.info("Останавливаю шлюз Hermes…")
 
         def work():
-            return backend.restart_gateway(lambda line: self.ctx.bus.post(lambda l=line: self.tg_out.appendPlainText(l)))
+            return backend.run_hermes(["gateway", "stop"], lambda line: None, timeout=40)
 
-        def done(msg, err):
-            self.tg_apply.setEnabled(True)
-            self.tg_status.bad(str(err)) if err else self.tg_status.ok(str(msg))
+        def done(code, err):
+            if err or code:
+                self.tg_state.warn("Не удалось остановить шлюз автоматически. Закройте окно шлюза Hermes вручную.")
+            else:
+                self.tg_state.ok("Шлюз остановлен. Бот Джарвиса подключится в течение 15 секунд.")
         background(self.ctx.bus, work, done)
 
 

@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from . import agent, backend, diag, models, teach, winio
+from . import agent, backend, diag, models, routines, teach, telegram, winio
 from .core import (Assistant, Hermes, NullRecorder, Recorder, Speaker, Transcriber, load_settings, log)
 
 # Состояния, которые видит окно
@@ -52,6 +52,9 @@ class AssistantService:
         self._base_detail = ""
         self._last_motion = time.monotonic()
         self._last_bytes = -1
+        self.telegram: Optional[telegram.TelegramBot] = None
+        self.on_telegram: Callable[[], None] = lambda: None
+        self._tg_assistants: Dict[int, Assistant] = {}
 
     # --- состояние ---------------------------------------------------------
     def _set(self, state: str, detail: str = "") -> None:
@@ -317,6 +320,7 @@ class AssistantService:
             log.exception("Встроенный движок не подготовился")
             diag.record_error("встроенный движок", f"{type(exc).__name__}: {exc}")
         log.info("Движок ответов: %s", "встроенный (%s)" % assistant.agent.endpoint.label if assistant.agent else "Hermes")
+        assistant.tools["routine"] = routine_tool()
         self.attach(assistant)
         return assistant
 
@@ -336,7 +340,9 @@ class AssistantService:
             self.on_event("heard", text)
             from . import intents
             intent = intents.parse(text, recording=bool(assistant.teach and assistant.teach.recording))
-            if intent:                       # запись действий и запуск задач обрабатываются без нейросети
+            if intent and intent.kind == "routine_run":
+                ok, reply = True, run_routine_text(assistant, intent.arg)
+            elif intent:                     # запись действий и запуск задач обрабатываются без нейросети
                 ok, reply = True, assistant.handle_intent(intent)
             else:
                 result = assistant.think(text)
@@ -352,6 +358,164 @@ class AssistantService:
                     assistant.rec.unmute()
 
         threading.Thread(target=work, name="jarvis-chat", daemon=True).start()
+
+
+    # --- Telegram ------------------------------------------------------------
+    def start_telegram(self) -> None:
+        """Запускает бота, если он настроен и включён. Работает независимо от микрофона."""
+        self.stop_telegram()
+        telegram.import_from_hermes()
+        cfg = telegram.load_config()
+        bot = telegram.TelegramBot(TelegramBridge(self))
+        bot.on_status = self.on_telegram
+        self.telegram = bot
+        if cfg.get("enabled", True):
+            bot.start()
+        else:
+            bot._set("off", "Бот выключен.")
+
+    def stop_telegram(self) -> None:
+        bot, self.telegram = self.telegram, None
+        if bot is not None:
+            bot.stop()
+
+    def tg_assistant(self, chat_id: int) -> Assistant:
+        """Отдельный собеседник на каждый чат: разговор в Telegram не смешивается с голосовым."""
+        a = self._tg_assistants.get(chat_id)
+        if a is None:
+            cfg = load_settings()
+            silent = Speaker(dict(cfg["tts"], enabled=False))
+            a = self.make_assistant(cfg, None, silent, Hermes(cfg["hermes"]), NullRecorder())
+            a.on_event = lambda kind, text: None
+            self._tg_assistants[chat_id] = a
+        return a
+
+    def transcriber(self) -> Transcriber:
+        if self._stt is None:
+            cfg = load_settings()
+            self._stt = Transcriber(cfg["stt"])
+        return self._stt
+
+
+def routine_tool() -> agent.Tool:
+    """Шаблоны рутин для модели: посмотреть и сохранить по просьбе владельца («сохрани шаблон утро: …»)."""
+    def run(args: list) -> tuple:
+        if not args or args[0] == "list":
+            items = routines.load_all()
+            return True, ("Шаблоны: " + "; ".join(f"{r.name} ({len(r.steps)} шаг.)" for r in items)) if items \
+                else "Шаблонов пока нет."
+        action, rest = args[0], " ".join(args[1:]).strip()
+        if action == "show":
+            r = routines.find(rest)
+            return (True, f"{r.name}: " + " | ".join(r.steps)) if r else (False, "такого шаблона нет")
+        if action == "save":
+            name, _, body = rest.partition(" ")
+            if ":" in rest:
+                name, _, body = rest.partition(":")
+            steps = [x.strip() for x in body.split(";") if x.strip()]
+            if not name.strip() or not steps:
+                return False, "нужно: routine save <имя>: шаг; шаг; шаг"
+            r = routines.save(name.strip(), "\n".join("- " + x for x in steps))
+            return True, f"Шаблон «{r.name}» сохранён, шагов: {len(r.steps)}. Запуск: «выполни шаблон {r.name}»."
+        if action == "delete":
+            return (True, "Шаблон удалён.") if routines.delete(rest) else (False, "такого шаблона нет")
+        return False, "действия: list, show, save, delete"
+    return agent.Tool("routine list|show <имя>|save <имя>: шаг; шаг|delete <имя>",
+                      "шаблоны рутин владельца (выполнить: попросите его сказать «выполни шаблон …»)", run)
+
+
+def run_routine_text(assistant: Assistant, query: str, cancel: Optional[threading.Event] = None,
+                     on_action: Optional[Callable[[str], None]] = None, channel: str = "voice",
+                     tools: Optional[Dict[str, Any]] = None) -> str:
+    """Шаблон без голоса: для поля «Написать Джарвису» и Telegram."""
+    items = routines.load_all()
+    r = routines.find(query, items)
+    if r is None:
+        return ("Такого шаблона нет. Есть: " + ", ".join(x.name for x in items[:8]) + ".") if items \
+            else "Шаблонов пока нет: создайте их в разделе «Задачи» или попросите меня сохранить шаблон."
+    if assistant.agent is None:
+        return "Шаблоны выполняет встроенный движок: включите его в разделе «Подключения»."
+    reply = assistant.think(routines.instruction(r, routines.split_args(query, r)), cancel, on_action=on_action,
+                            channel=channel, tools=tools, max_steps=routines.step_budget(r))
+    return reply.text
+
+
+class TelegramBridge(telegram.Handler):
+    """Задания из Telegram выполняет тот же движок, что и голос, с теми же командами ПК."""
+
+    def __init__(self, service: AssistantService):
+        self.svc = service
+
+    def _tools(self, job: telegram.Job) -> Dict[str, Any]:
+        def send(args: list) -> tuple:
+            import os
+            path = " ".join(args).strip().strip('"')
+            if not path or not os.path.isfile(path):
+                return False, f"файла нет: {path}"
+            job.files.append(path)
+            return True, "файл будет отправлен владельцу"
+        return {"send": agent.Tool("send <путь к файлу>", "прислать файл владельцу в Telegram", send)}
+
+    def ask(self, job: telegram.Job) -> str:
+        from . import intents
+        a = self.svc.tg_assistant(job.chat_id)
+        intent = intents.parse(job.text)
+        if intent and intent.kind == "routine_run":
+            return self.run_routine(job, intent.arg)
+        if intent and intent.kind == "task_run":
+            return a.handle_intent(intent)
+        reply = a.think(job.text, job.cancel, on_action=job.progress, channel="telegram", tools=self._tools(job))
+        if reply.ok:
+            a.remember(job.text, reply.text)
+        job.files += telegram.screenshot_paths(reply.results)
+        return reply.text
+
+    def run_routine(self, job: telegram.Job, name: str) -> str:
+        a = self.svc.tg_assistant(job.chat_id)
+        return run_routine_text(a, name, job.cancel, job.progress, "telegram", self._tools(job))
+
+    def screenshot(self) -> Optional[str]:
+        import tempfile
+        import os
+        path = os.path.join(tempfile.gettempdir(), f"jarvis_screen_{int(time.time())}.png")
+        ok, _ = agent.run_pc(["screenshot", path])
+        return path if ok else None
+
+    def status(self) -> str:
+        ok, text = agent.run_pc(["sysinfo"])
+        state = STATE_TEXT.get(self.svc.state, self.svc.state)
+        return f"Джарвис: {state.lower()}.\n{text}"
+
+    def catalog(self) -> str:
+        from . import tasks
+        rs = routines.load_all()
+        ts = tasks.list_tasks()
+        parts = []
+        parts.append("Шаблоны: " + (", ".join(r.name for r in rs) if rs else "нет") + " (запуск: /run имя)")
+        parts.append("Записанные задачи: " + (", ".join(t.name for t in ts) if ts else "нет")
+                     + " (запуск: «выполни задачу имя»)")
+        return "\n".join(parts)
+
+    def transcribe(self, data: bytes) -> str:
+        from .audio import decode_audio
+        import numpy as np
+        pcm, rate = decode_audio(data)
+        if rate != 16000:                       # Whisper ждёт 16 кГц
+            n = int(len(pcm) * 16000 / rate)
+            pcm = np.interp(np.linspace(0, len(pcm) - 1, n), np.arange(len(pcm)), pcm).astype("float32")
+        return self.svc.transcriber().transcribe(pcm)
+
+    def voice(self, text: str) -> Optional[bytes]:
+        from .core import clean_for_speech
+        try:
+            cfg = load_settings()
+            return Speaker(cfg["tts"]).synth_bytes(clean_for_speech(text, 900))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Telegram: голосовой ответ не получился: %s", exc)
+            return None
+
+    def reset(self, chat_id: int) -> None:
+        self.svc._tg_assistants.pop(chat_id, None)
 
 
 def prepare_background() -> None:

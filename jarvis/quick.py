@@ -36,7 +36,30 @@ def _rules() -> List[Tuple[re.Pattern, object]]:
         (rx(r"^заблокируй (?:компьютер|экран|пк)$"), ["lock"]),
         (rx(r"^(?:включи|вруби|запусти) игровой режим$"), ["game-mode", "on"]),
         (rx(r"^(?:выключи|отключи) игровой режим$"), ["game-mode", "off"]),
+        (rx(r"^(?:открой|покажи) (?:мои )?заметки$"), ["notes", "open"]),
+        (rx(r"^(?:какие|покажи|перечисли) (?:у меня )?(?:есть )?заметки$|^список заметок$"), ["notes", "list"]),
+        (rx(r"^(?:запиши|запомни|создай|сделай|добавь) (?:в )?(?:заметку|заметки|новую заметку)\b.+"),
+         lambda m, raw: _tail(raw, NOTE_RAW, ["notes", "add"])),
+        (rx(r"^закрои (?:все )?(?:папки|окна проводника)$"), ["folder", "close", "все"]),
+        (rx(r"^(?:открои|покажи) (?:папку )?(рабочии стол|документы|загрузки|изображения|картинки|музыку|видео)$"),
+         lambda m: ["folder", "open", {"рабочии стол": "рабочий стол", "музыку": "музыка"}.get(m.group(1), m.group(1))]),
+        (rx(r"^открои папку .+"), lambda m, raw: _tail(raw, FOLDER_RAW.replace("ACT", "открой"), ["folder", "open"])),
+        (rx(r"^закрои папку .+"), lambda m, raw: _tail(raw, FOLDER_RAW.replace("ACT", "закрой"), ["folder", "close"])),
+        (rx(r"^(?:создаи|сделаи) (?:новую )?папку .+"),
+         lambda m, raw: _tail(raw, FOLDER_RAW.replace("ACT", "(?:создай|сделай)(?:\\s+новую)?"), ["folder", "create"])),
     ]
+
+
+# Текст заметки и имена папок берутся из исходной фразы: normalize() портит «й» и «ё», а в именах они важны
+NOTE_RAW = r"^\W*(?:джарвис\W*)?(?:запиши|запомни|создай|сделай|добавь)\s+(?:в\s+)?(?:новую\s+)?заметк[уи]\s*[:,—-]?\s*(.+)$"
+FOLDER_RAW = r"^\W*(?:джарвис\W*)?ACT\s+папку\s+(.+?)[.!?]*$"
+
+
+def _tail(raw: str, pattern: str, head: List[str]) -> Optional[List[str]]:
+    m = re.match(pattern, raw.strip(), re.I | re.S)
+    if not m or not m.group(1).strip():
+        return None
+    return head + [m.group(1).strip().strip("«»\"")]
 
 
 _RULES = _rules()
@@ -53,7 +76,9 @@ def match(text: str) -> Optional[List[str]]:
     for pattern, action in _RULES:
         m = pattern.match(low)
         if m:
-            return action(m) if callable(action) else list(action)
+            if not callable(action):
+                return list(action)
+            return action(m, text) if action.__code__.co_argcount == 2 else action(m)
     m = _OPEN.match(low)
     if m and m.group(1) in _APPS:
         return ["open", _APPS[m.group(1)]]

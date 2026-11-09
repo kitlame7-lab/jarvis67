@@ -32,7 +32,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -73,7 +73,10 @@ DEFAULTS: Dict[str, Any] = {
         "block_ms": 30,
         "silence_threshold": 0.012,
         "auto_threshold": True,
-        "silence_tail_ms": 800,
+        "silence_tail_ms": 600,      # пауза, после которой фраза считается законченной
+        "early_ms": 300,             # распознавание начинается уже после такой паузы (если человек продолжит — заново)
+        "barge_in": "voice",         # voice — перебить можно любой фразой; wake — только по имени; off — нельзя
+        "barge_boost": 2.5,          # во время своей речи порог громкости выше: колонки не должны перебивать Джарвиса
         "min_speech_ms": 350,
         "max_utterance_s": 25.0,
         "preroll_ms": 300,
@@ -117,6 +120,7 @@ DEFAULTS: Dict[str, Any] = {
         "max_steps": 5,              # сколько раз подряд модель может запросить команды
         "deadline_s": 100,           # общий предел на одну просьбу
     },
+    "notes": {"dir": ""},            # пусто — «Документы\\Заметки Джарвиса»
     "ui": {"theme": "light"},        # light | dark
     "updates": {"auto_check": True},
     "history_turns": 6,
@@ -390,6 +394,7 @@ class Transcriber:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
         self._model = None
+        self._lock = threading.Lock()        # голос с микрофона и голосовые из Telegram распознаются по очереди
 
     def load(self, on_progress: Optional[Callable[["models.Progress"], None]] = None,
              cancel: Optional[threading.Event] = None) -> None:
@@ -408,16 +413,21 @@ class Transcriber:
 
     def transcribe(self, audio) -> str:
         self.load()
-        segments, _ = self._model.transcribe(
-            audio,
-            language=self.cfg.get("language") or None,
-            beam_size=int(self.cfg.get("beam_size", 1)),
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            condition_on_previous_text=False,
-            initial_prompt=self.cfg.get("initial_prompt") or None,
-        )
-        return " ".join(s.text.strip() for s in segments).strip()
+        with self._lock:
+            t0 = time.monotonic()
+            segments, _ = self._model.transcribe(
+                audio,
+                language=self.cfg.get("language") or None,
+                beam_size=int(self.cfg.get("beam_size", 1)),
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                condition_on_previous_text=False,
+                without_timestamps=True,          # метки времени не нужны, а без них быстрее
+                initial_prompt=self.cfg.get("initial_prompt") or None,
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
+        log.debug("Распознано за %.2f с", time.monotonic() - t0)
+        return text
 
 
 
@@ -483,25 +493,90 @@ def play_mp3(path: str, slack_s: float = 5.0, cancel: Optional[threading.Event] 
         mci(f"close {alias}", None, 0, None)
 
 
+def play_wav_windows(pcm: Any, rate: int, cancel: threading.Event) -> bool:
+    """Запасное воспроизведение через winsound: асинхронно, с остановкой по флагу."""
+    import wave
+    import winsound  # type: ignore[import-not-found]
+    import numpy as np
+    fd, path = tempfile.mkstemp(prefix="jarvis-say-", suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(rate))
+            w.writeframes((np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes())
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        end = time.monotonic() + len(pcm) / float(rate) + 0.3
+        while time.monotonic() < end:
+            if cancel.is_set():
+                winsound.PlaySound(None, 0)
+                return False
+            time.sleep(0.03)
+        return True
+    finally:
+        time.sleep(0.05)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 SAPI_SCRIPT = (
     "Add-Type -AssemblyName System.Speech;"
     "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
     "$v = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'ru*' } | Select-Object -First 1;"
     "if ($v) { $s.SelectVoice($v.VoiceInfo.Name) };"
+    "if ($env:JARVIS_WAV) { $s.SetOutputToWaveFile($env:JARVIS_WAV) };"
     "$s.Speak($env:JARVIS_SAY)"
 )
 
 
 class Speaker:
+    """Голос Джарвиса. Фразы синтезируются и играются по одной: следующая готовится, пока звучит текущая,
+    а любая может быть оборвана мгновенно (перебивание, «стоп»)."""
     COOLDOWN_S = 600.0
 
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any], player: Any = None):
         self.cfg = cfg
         self.enabled = bool(cfg.get("enabled", True))
         self._down_until = 0.0
         self._choice: Optional[Tuple[str, Optional[str], Optional[str]]] = None
         self.cancel = threading.Event()      # «Остановить» обрывает речь сразу, а не после последнего слова
+        self._player = player
+        self.audible = IS_WIN or player is not None
+        self.spoken: "deque[Tuple[float, str]]" = deque(maxlen=16)   # что и когда начали говорить (для эхо-фильтра)
 
+    # --- проигрыватель --------------------------------------------------
+    @property
+    def player(self) -> Any:
+        if self._player is None:
+            from .audio import Player
+            self._player = Player()
+        return self._player
+
+    @property
+    def playing(self) -> bool:
+        return bool(self._player is not None and self._player.playing)
+
+    def interrupt(self) -> None:
+        """Обрывает текущую фразу (сессии сами решают, говорить ли дальше)."""
+        if self._player is not None:
+            self._player.stop()
+
+    def duck(self) -> None:
+        if self._player is not None:
+            self._player.duck()
+
+    def unduck(self) -> None:
+        if self._player is not None:
+            self._player.unduck()
+
+    def recent_text(self, seconds: float = 10.0) -> str:
+        now = time.monotonic()
+        return " ".join(t for at, t in list(self.spoken) if now - at < seconds)
+
+    # --- синтез ---------------------------------------------------------
     def attempts(self) -> List[Tuple[str, Optional[str], Optional[str]]]:
         """Варианты (голос, скорость, высота) от настроенного к самым простым.
         Edge иногда отвечает «No audio was received» на необычные параметры."""
@@ -539,19 +614,85 @@ class Speaker:
                 log.warning("Голос Microsoft (%s, rate=%s, pitch=%s): %s", voice, rate, pitch, exc)
         raise last or RuntimeError("голос Microsoft недоступен")
 
-    def _say_neural(self, text: str) -> None:
+    def synth_bytes(self, text: str) -> bytes:
         fd, path = tempfile.mkstemp(prefix="jarvis-tts-", suffix=".mp3")
         os.close(fd)
         try:
             self.synth(text, path)
-            play_mp3(path, cancel=self.cancel)
+            return Path(path).read_bytes()
         finally:
             try:
                 os.unlink(path)
             except OSError:
                 pass
 
+    def _sapi_wav(self, text: str) -> bytes:
+        fd, path = tempfile.mkstemp(prefix="jarvis-sapi-", suffix=".wav")
+        os.close(fd)
+        try:
+            env = dict(os.environ, JARVIS_SAY=text, JARVIS_WAV=path)
+            subprocess.run(["powershell", "-NoProfile", "-Command", SAPI_SCRIPT], env=env, capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            data = Path(path).read_bytes()
+            if len(data) < 100:
+                raise RuntimeError("голос Windows не создал звук")
+            return data
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def render(self, text: str) -> Optional[Tuple[Any, int]]:
+        """Фраза в звук (PCM): голос Microsoft, при сбое голос Windows. None — говорить нечем."""
+        from .audio import decode_audio
+        backend = self.cfg.get("backend", "auto")
+        if backend in ("auto", "edge", "neural") and time.time() >= self._down_until:
+            try:
+                return decode_audio(self.synth_bytes(text))
+            except Exception as exc:  # noqa: BLE001 — сеть или звук: уходим на запасной голос
+                self._down_until = time.time() + self.COOLDOWN_S
+                log.warning("Голос Microsoft недоступен (%s). Говорю голосом Windows, следующая попытка через 10 минут", exc)
+        if not IS_WIN:
+            return None
+        try:
+            return decode_audio(self._sapi_wav(text))
+        except Exception as exc:  # noqa: BLE001
+            log.error("Озвучить не удалось: %s", exc)
+            return None
+
+    def play_pcm(self, pcm: Any, rate: int, cancel: Optional[threading.Event] = None) -> bool:
+        try:
+            return self.player.play(pcm, rate, cancel)
+        except Exception as exc:  # noqa: BLE001 — нет устройства вывода у sounddevice: играем средствами Windows
+            if not IS_WIN:
+                raise
+            log.warning("Проигрыватель недоступен (%s), играю через Windows", exc)
+            return play_wav_windows(pcm, rate, cancel or self.cancel)
+
+    # --- старый путь «сказать целиком» ------------------------------------
+    def _say_neural(self, text: str) -> None:
+        from .audio import decode_audio
+        data = self.synth_bytes(text)
+        self.spoken.append((time.monotonic(), text))
+        try:
+            pcm, rate = decode_audio(data)
+            self.play_pcm(pcm, rate, self.cancel)
+        except Exception as exc:  # noqa: BLE001 — нет устройства вывода или декодера: проигрываем как раньше
+            log.warning("Проигрыватель недоступен (%s), играю через Windows MCI", exc)
+            fd, path = tempfile.mkstemp(prefix="jarvis-tts-", suffix=".mp3")
+            os.close(fd)
+            try:
+                Path(path).write_bytes(data)
+                play_mp3(path, cancel=self.cancel)
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
     def _say_sapi(self, text: str) -> None:
+        self.spoken.append((time.monotonic(), text))
         env = dict(os.environ, JARVIS_SAY=text)
         subprocess.run(["powershell", "-NoProfile", "-Command", SAPI_SCRIPT], env=env,
                        capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
@@ -575,6 +716,106 @@ class Speaker:
             self._say_sapi(speech)
         except Exception as exc:  # noqa: BLE001
             log.error("Озвучить не удалось: %s", exc)
+
+    def session(self, cancel: Optional[threading.Event] = None) -> "SpeechSession":
+        return SpeechSession(self, cancel or threading.Event())
+
+
+class SpeechSession:
+    """Речь одного ответа: фразы приходят по мере написания моделью и звучат без пауз между ними.
+
+    Синтез фразы N+1 идёт, пока звучит фраза N. stop() обрывает всё сразу."""
+
+    def __init__(self, speaker: Speaker, cancel: threading.Event):
+        self.sp, self.cancel = speaker, cancel
+        self.texts: "queue.Queue[Optional[str]]" = queue.Queue()
+        self.sounds: "queue.Queue[Optional[Tuple[str, Any]]]" = queue.Queue(maxsize=2)
+        self.started = threading.Event()        # первая фраза зазвучала (или озвучка выключена)
+        self.finished = threading.Event()
+        self.said: List[str] = []
+        self.pushed = 0
+        self._closed = False
+        threading.Thread(target=self._synth_loop, name="jarvis-tts", daemon=True).start()
+        threading.Thread(target=self._play_loop, name="jarvis-play", daemon=True).start()
+
+    def _stopped(self) -> bool:
+        return self.cancel.is_set() or self.sp.cancel.is_set()
+
+    def push(self, text: str) -> None:
+        speech = clean_for_speech(text, int(self.sp.cfg.get("max_chars", 600)))
+        if speech and not self._closed:
+            log.info("Джарвис: %s", speech)
+            self.pushed += 1
+            self.texts.put(speech)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self.texts.put(None)
+
+    def stop(self) -> None:
+        self.cancel.set()
+        self.sp.interrupt()
+        self.close()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Ждёт конца речи. False — оборвали или вышло время."""
+        end = None if timeout is None else time.monotonic() + timeout
+        while not self.finished.wait(0.05):
+            if self._stopped():
+                return False
+            if end is not None and time.monotonic() > end:
+                return False
+        return not self._stopped()
+
+    def _put_sound(self, item: Optional[Tuple[str, Any]]) -> bool:
+        while not self._stopped():
+            try:
+                self.sounds.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _synth_loop(self) -> None:
+        try:
+            while not self._stopped():
+                try:
+                    text = self.texts.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if text is None:
+                    break
+                sound = self.sp.render(text) if (self.sp.enabled and self.sp.audible) else None
+                if not self._put_sound((text, sound)):
+                    return
+        except Exception:  # noqa: BLE001 — сбой синтеза не должен оставить ответ без конца
+            log.exception("Сбой синтеза речи")
+        finally:
+            self._put_sound(None)
+
+    def _play_loop(self) -> None:
+        try:
+            while not self._stopped():
+                try:
+                    item = self.sounds.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                text, sound = item
+                self.sp.spoken.append((time.monotonic(), text))
+                self.said.append(text)
+                self.started.set()
+                if sound is None:
+                    continue
+                try:
+                    self.sp.play_pcm(sound[0], sound[1], self.cancel)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Проигрыватель недоступен: %s", exc)
+        finally:
+            self.started.set()
+            self.finished.set()
 
 
 # --------------------------------------------------------------------------
@@ -601,6 +842,8 @@ class Recorder:
         self.paused = False
         self.stop = threading.Event()
         self._stream = None
+        # Во сколько раз поднять порог громкости прямо сейчас (Джарвис говорит в колонки). Подключает ассистент.
+        self.boost: Callable[[], float] = lambda: 1.0
 
     def device(self):
         raw = self.cfg.get("device")
@@ -661,39 +904,63 @@ class Recorder:
         return min(0.08, max(float(self.cfg["silence_threshold"]), ambient * 3.5))
 
     def utterances(self):
-        """Выдаёт по одной произнесённой фразе (numpy float32)."""
+        """Выдаёт по одной законченной фразе (numpy float32)."""
+        for kind, audio in self.segments():
+            if kind == "final":
+                yield audio
+
+    def segments(self):
+        """События речи: ("start", None) — человек заговорил; ("voice", None) — говорит дольше 0,35 с; ("draft", звук) — короткая пауза, можно начинать
+        распознавать; ("final", звук) — фраза закончена; ("drop", None) — это был короткий шум."""
         np = self.np
         ms = int(self.cfg["block_ms"])
-        threshold = float(self.cfg["silence_threshold"])
-        tail_blocks = int(self.cfg["silence_tail_ms"] / ms)
+        base = float(self.cfg["silence_threshold"])
+        tail_blocks = max(1, int(self.cfg["silence_tail_ms"] / ms))
+        early_blocks = max(1, int(self.cfg.get("early_ms", 300) / ms))
         min_blocks = int(self.cfg["min_speech_ms"] / ms)
         max_blocks = int(float(self.cfg["max_utterance_s"]) * 1000 / ms)
         preroll = int(self.cfg["preroll_ms"] / ms)
 
+        keep = max(1, int(200 / ms))           # после речи оставляем 200 мс тишины, остальное распознавать незачем
         ring: List[Any] = []
         collected: List[Any] = []
         speaking = False
-        silent_run = 0
+        silent_run = voiced = 0
+        drafted = False
         while not self.stop.is_set():
             try:
                 chunk = self.q.get(timeout=0.5)
             except queue.Empty:
                 continue
             level = float(np.sqrt(np.mean(np.square(chunk))))
+            threshold = base * max(1.0, float(self.boost()))
             if not speaking:
                 ring.append(chunk)
                 if len(ring) > preroll:
                     ring.pop(0)
                 if level >= threshold:
-                    speaking, collected, ring, silent_run = True, list(ring) + [chunk], [], 0
+                    speaking, collected, ring, silent_run, voiced, drafted = True, list(ring) + [chunk], [], 0, 1, False
+                    yield "start", None
                 continue
             collected.append(chunk)
-            silent_run = silent_run + 1 if level < threshold else 0
+            if level < threshold:
+                silent_run += 1
+            else:
+                silent_run, drafted, voiced = 0, False, voiced + 1
+                if voiced == min_blocks:
+                    yield "voice", None              # это уже не щелчок, а речь: можно приглушить свой голос
+            if silent_run == early_blocks and not drafted and voiced >= min_blocks and early_blocks < tail_blocks:
+                drafted = True
+                yield "draft", np.concatenate(collected[:len(collected) - silent_run + keep])
             if silent_run >= tail_blocks or len(collected) >= max_blocks:
-                audio = np.concatenate(collected)
-                speaking, collected, silent_run = False, [], 0
-                if len(audio) >= min_blocks * self._block():
-                    yield audio
+                cut = len(collected) - silent_run + keep if silent_run >= tail_blocks else len(collected)
+                audio = np.concatenate(collected[:cut])
+                enough = voiced >= min_blocks
+                speaking, collected, silent_run, voiced = False, [], 0, 0
+                if enough:
+                    yield "final", audio
+                else:
+                    yield "drop", None
 
 
 # --------------------------------------------------------------------------
@@ -735,6 +1002,32 @@ class Reply:
     ok: bool
     text: str
     source: str          # quick — без нейросети; native — встроенный движок; hermes; timeout
+    streamed: bool = False                  # ответ уже озвучивался по мере написания
+    results: List[Tuple[str, bool, str]] = field(default_factory=list)   # выполненные команды ПК
+
+
+class _PlainSession:
+    """Сессия речи для простых «говорилок» без потоковой озвучки (тесты, текстовый режим)."""
+
+    def __init__(self, speaker: Any, cancel: threading.Event):
+        self.sp, self.cancel, self.said, self.pushed = speaker, cancel, [], 0
+        self.started = threading.Event()
+
+    def push(self, text: str) -> None:
+        if self.cancel.is_set():
+            return
+        self.pushed += 1
+        self.said.append(text)
+        self.started.set()
+        self.sp.say(text)
+
+    def close(self) -> None: ...
+
+    def stop(self) -> None:
+        self.cancel.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return not self.cancel.is_set()
 
 
 class Assistant:
@@ -754,12 +1047,67 @@ class Assistant:
         # Запись действий и запуск задач подключает служба; без них голосовые команды записи отвечают отказом
         self.teach: Optional[Any] = None
         self.task_runner: Optional[Callable[[Any], str]] = None
+        # Команды, которые выполняет сам Джарвис (шаблоны рутин и т. п.): имя -> agent.Tool. Подключает служба.
+        self.tools: Dict[str, Any] = {}
+        self.routine_runner: Optional[Callable[[str, Optional[threading.Event]], str]] = None
+        # Текущий ход разговора: его флаг отмены. Новая фраза человека отменяет старый ход.
+        self._turn: Optional[threading.Event] = None
+        self._turn_lock = threading.Lock()
+        audio = cfg.get("audio", {})
+        self.barge = str(audio.get("barge_in", "voice"))
+        if hasattr(recorder, "boost") and self.barge != "off":
+            factor = float(audio.get("barge_boost", 2.5))
+            recorder.boost = lambda: factor if getattr(self.speaker, "playing", False) else 1.0
 
     def stop(self) -> None:
         self.cancel.set()
+        self.interrupt()
         flag = getattr(self.speaker, "cancel", None)
         if flag is not None:
             flag.set()
+
+    # --- ходы разговора и перебивание ---------------------------------------
+    def _begin_turn(self) -> threading.Event:
+        flag = threading.Event()
+        flag.done = threading.Event()        # type: ignore[attr-defined]  # ход закончился (история записана)
+        with self._turn_lock:
+            prev = self._turn
+            if prev is not None:
+                prev.set()
+            self._turn = flag
+        if prev is not None:
+            # прерванный ответ за доли секунды записывает в историю, что успел сказать: уточнение должно это знать
+            prev.done.wait(1.5)  # type: ignore[attr-defined]
+        return flag
+
+    def _end_turn(self, flag: threading.Event) -> None:
+        flag.done.set()  # type: ignore[attr-defined]
+        with self._turn_lock:
+            if self._turn is flag:
+                self._turn = None
+
+    def busy(self) -> bool:
+        return self._turn is not None or bool(getattr(self.speaker, "playing", False))
+
+    def interrupt(self) -> None:
+        """Обрывает текущий ответ: и ожидание модели, и речь."""
+        with self._turn_lock:
+            if self._turn is not None:
+                self._turn.set()
+        stop = getattr(self.speaker, "interrupt", None)
+        if stop is not None:
+            stop()
+
+    def _session(self, cancel: threading.Event) -> Any:
+        make = getattr(self.speaker, "session", None)
+        return make(cancel) if make is not None else _PlainSession(self.speaker, cancel)
+
+    def _mute(self) -> bool:
+        """Глушим микрофон на время ответа, только если перебивание выключено."""
+        if self.barge == "off":
+            self.rec.mute()
+            return True
+        return False
 
     def _event(self, kind: str, text: str) -> None:
         try:
@@ -789,28 +1137,42 @@ class Assistant:
 
     # --- речь -----------------------------------------------------------
     def speak(self, text: str) -> None:
-        self.rec.mute()
+        muted = self._mute()
+        flag = threading.Event()
+        session = self._session(flag)
         try:
             self._event("reply", text)
-            self.speaker.say(text)
+            session.push(text)
+            session.close()
+            session.wait(timeout=120)
         finally:
-            self.rec.unmute()
+            if muted:
+                self.rec.unmute()
 
-    def think(self, command: str, cancel: Optional[threading.Event] = None) -> Reply:
-        """Находит ответ. Простое выполняется сразу, остальное решает модель; Hermes — запасной путь."""
+    def think(self, command: str, cancel: Optional[threading.Event] = None,
+              on_text: Optional[Callable[[str], None]] = None, on_action: Optional[Callable[[str], None]] = None,
+              channel: str = "voice", tools: Optional[Dict[str, Any]] = None, max_steps: Optional[int] = None) -> Reply:
+        """Находит ответ. Простое выполняется сразу, остальное решает модель (потоком, если передан on_text);
+        Hermes — запасной путь."""
         from . import llm, quick          # quick берёт normalize отсюда: импорт внутри функции избегает цикла
         t0 = time.monotonic()
         cancel = cancel or self.cancel
-        tokens = quick.match(command)
+        tokens = quick.match(command) if max_steps is None else None
         if tokens:
             refusal = agent_mod.check_allowed(tokens)
+            if on_action is not None and not refusal:
+                on_action(" ".join(tokens))
             ok, text = (False, refusal) if refusal else self.run_pc(tokens)
             reply = Reply(ok, text, "quick")
+            reply.results = [(" ".join(tokens), ok, text)]
         elif self.agent is not None:
             try:
-                answer = self.agent.ask(command, [(u, r) for u, r, _ in self.recent()], cancel)
+                answer = self.agent.ask(command, [(u, r) for u, r, _ in self.recent()], cancel, on_text=on_text,
+                                        on_action=on_action, tools=dict(self.tools, **(tools or {})),
+                                        channel=channel, max_steps=max_steps)
                 log.info("Ответ: %d шаг., модель %.1f с, команды %.1f с", answer.steps, answer.llm_s, answer.tools_s)
-                reply = Reply(True, answer.text, "native")
+                reply = Reply(True, answer.text, "native", streamed=answer.spoken)
+                reply.results = answer.results
             except llm.LLMError as exc:
                 reply = Reply(False, str(exc), "native")
         else:
@@ -821,24 +1183,43 @@ class Assistant:
         log.info("Ответ готов за %.1f с (%s, %s)", took, reply.source, "ok" if reply.ok else "сбой")
         return reply
 
-    def answer(self, command: str) -> str:
+    def answer(self, command: str, prompt: Optional[str] = None, max_steps: Optional[int] = None) -> str:
+        """Отвечает голосом. Речь начинается с первого готового предложения; новая фраза человека обрывает ответ.
+        prompt — задание для модели вместо самой фразы (шаблоны рутин)."""
         log.info("Вы: %s", command)
-        self._event("heard", command)
-        self.rec.mute()
+        if prompt is None:
+            self._event("heard", command)
+        turn = self._begin_turn()
+        muted = self._mute()
+        session = self._session(turn)
+        reply: Optional[Reply] = None
         try:
-            reply = self._wait_for(command)
-            if reply is None:
-                return ""                                  # нажали «Остановить»
+            reply = self._wait_for(prompt or command, turn, session, max_steps)
+            if reply is None:                                     # перебили или нажали «Остановить»
+                said = " ".join(getattr(session, "said", []))
+                if said:
+                    self.remember(command, said + " (меня перебили)")
+                return ""
             if reply.ok:
                 self.remember(command, reply.text)
             self._event("reply" if reply.ok else "error", reply.text)
-            self.speaker.say(reply.text)
+            if not (reply.ok and reply.streamed):
+                session.push(reply.text)
+            session.close()
+            session.wait(timeout=300)
             return reply.text
         finally:
-            self.rec.unmute()
+            if turn.is_set() or self.cancel.is_set():
+                session.stop()
+            else:
+                session.close()
+            if muted:
+                self.rec.unmute()
             self.last_reply_at = time.time()
+            self._end_turn(turn)
 
-    def _wait_for(self, command: str) -> Optional[Reply]:
+    def _wait_for(self, command: str, turn: threading.Event, session: Any,
+                  max_steps: Optional[int] = None) -> Optional[Reply]:
         """Ответ считается в отдельном потоке: зависший запрос не блокирует ни следующую просьбу, ни «Остановить»."""
         box: List[Reply] = []
         done = threading.Event()
@@ -846,7 +1227,7 @@ class Assistant:
 
         def job() -> None:
             try:
-                box.append(self.think(command, job_cancel))
+                box.append(self.think(command, job_cancel, on_text=session.push, max_steps=max_steps))
             except Exception:  # noqa: BLE001 — неожиданный сбой не должен оставить человека в тишине
                 log.exception("Сбой при поиске ответа")
                 box.append(Reply(False, f"Что-то пошло не так, {self.address}. Подробности в журнале.", "error"))
@@ -856,24 +1237,25 @@ class Assistant:
         threading.Thread(target=job, name="jarvis-ask", daemon=True).start()
         started = time.monotonic()
         ack_after = float(self.cfg["hermes"]["ack_after_s"])
-        deadline = float(self.cfg.get("engine", {}).get("deadline_s", 100))
+        deadline = float(self.cfg.get("engine", {}).get("deadline_s", 100)) * (3 if max_steps else 1)
         acked = False
-        while not done.wait(0.1):
-            if self.cancel.is_set():
+        while not done.wait(0.05):
+            if self.cancel.is_set() or turn.is_set():
                 job_cancel.set()
                 return None
             waited = time.monotonic() - started
-            if not acked and waited >= ack_after:
+            if not acked and waited >= ack_after and not getattr(session, "pushed", 0):
                 acked = True
-                self.speaker.say(f"Одну секунду, {self.address}.")
+                session.push(f"Одну секунду, {self.address}.")
             if waited >= deadline:
                 job_cancel.set()
                 TIMINGS.append((time.time(), "timeout", waited, False))
                 return Reply(False, f"Не дождался ответа, {self.address}. Попробуйте ещё раз или откройте «Диагностика».",
                              "timeout")
+        if turn.is_set() or self.cancel.is_set():
+            return None
         return box[0]
 
-    # --- обработка фразы ------------------------------------------------
     def handle_intent(self, intent: Any) -> str:
         """Выполняет команду самого Джарвиса (запись действий, запуск задачи) и возвращает, что сказать."""
         from . import tasks
@@ -907,7 +1289,31 @@ class Assistant:
             return self.task_runner(task)
         return ""
 
+    def run_routine(self, query: str) -> str:
+        """«Выполни шаблон утро»: шаги шаблона выполняет встроенный движок, отчёт звучит голосом."""
+        from . import routines
+        items = routines.load_all()
+        routine = routines.find(query, items)
+        a = self.address
+        if routine is None:
+            have = ", ".join(r.name for r in items[:6])
+            text = (f"Не нашёл такой шаблон, {a}. Есть: {have}." if items
+                    else f"Шаблонов пока нет, {a}. Создайте их в разделе «Задачи».")
+            self.speak(text)
+            return text
+        if self.agent is None:
+            text = f"Шаблоны выполняет встроенный движок, {a}. Включите его в разделе «Подключения»."
+            self.speak(text)
+            return text
+        log.info("Шаблон «%s»: %d шаг.", routine.name, len(routine.steps))
+        return self.answer(f"выполни шаблон {routine.name}",
+                           prompt=routines.instruction(routine, routines.split_args(query, routine)),
+                           max_steps=routines.step_budget(routine))
+
     def _run_intent(self, intent: Any, text: str) -> str:
+        if intent.kind == "routine_run":
+            self._event("heard", text)
+            return self.run_routine(intent.arg)
         log.info("Вы: %s (команда %s)", text, intent.kind)
         self._event("heard", text)
         reply = self.handle_intent(intent)
@@ -950,19 +1356,104 @@ class Assistant:
                 else "Добрый вечер" if 18 <= hour < 23 else "Доброй ночи")
         self.speak(f"{part}, {self.address}. {self.cfg['name']} к вашим услугам.")
 
-    def run(self, stop: threading.Event) -> None:
-        for audio in self.rec.utterances():
-            if stop.is_set():
-                break
+    def handle_command(self, command: str) -> str:
+        """Фраза уже обращена к Джарвису (имя сказано или он слушает после ответа)."""
+        from . import intents
+        intent = intents.parse(command)
+        return self._run_intent(intent, command) if intent else self.answer(command)
+
+    def _spawn(self, fn: Callable[..., Any], *args: Any) -> None:
+        def work() -> None:
             try:
-                text = self.stt.transcribe(audio)
-                if text:
-                    log.info("Слышу: %s", text)
-                self.handle_transcript(text)
-            except Exception:  # noqa: BLE001 — одна плохая фраза не должна валить ассистента
-                log.exception("Сбой при обработке фразы")
+                fn(*args)
+            except Exception:  # noqa: BLE001 — сбой одного ответа не должен останавливать слушание
+                log.exception("Сбой при ответе")
+        threading.Thread(target=work, name="jarvis-turn", daemon=True).start()
+
+    def on_heard(self, text: str) -> None:
+        """Решение в потоке слушания: ответить, перебить текущий ответ или пропустить (эхо, шум)."""
+        from .speech import echo_score
+        text = (text or "").strip()
+        if not text or is_hallucination(text):
+            self.speaker_unduck()
+            return
+        log.info("Слышу: %s", text)
+        if self.teach is not None and self.teach.recording:
+            self.handle_transcript(text)
+            return
+        busy = self.busy()
+        if STOP_RE.match(normalize(text)):
+            if busy:
+                log.info("Остановлено голосом")
+                self.interrupt()
+                self.last_reply_at = time.time()
+            return
+        if not busy:
+            self._spawn(self.handle_transcript, text)
+            return
+        recent = getattr(self.speaker, "recent_text", lambda s=10.0: "")(10.0)
+        if recent and echo_score(text, recent) >= 0.6:
+            log.info("Это мой собственный голос из колонок, пропускаю")
+            self.speaker_unduck()
+            return
+        wake = self.cfg["wake"]
+        hit = detect_wake(text, wake["words"], float(wake["fuzzy_ratio"]))
+        addressed = hit.triggered or (self.barge == "voice" and len(normalize(text).split()) >= 2)
+        if self.barge == "off" or not addressed:
+            self.speaker_unduck()
+            return
+        log.info("Перебили: %s", text)
+        self.interrupt()
+        command = hit.command if hit.triggered else text
+        if not command:
+            self._spawn(self.speak, f"Слушаю, {self.address}.")
+            self.last_reply_at = time.time()
+            return
+        self._spawn(self.handle_command, command)
+
+    def speaker_unduck(self) -> None:
+        fn = getattr(self.speaker, "unduck", None)
+        if fn is not None:
+            fn()
+
+    def run(self, stop: threading.Event) -> None:
+        """Слушает всё время, в том числе пока Джарвис говорит: так его можно перебить.
+
+        Распознавание начинается уже на короткой паузе («черновик»); если человек не продолжил, к концу паузы текст
+        готов и ответ начинается сразу."""
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(1, thread_name_prefix="jarvis-stt")
+        draft: Optional[Tuple[int, Any]] = None
+        segments = self.rec.segments() if hasattr(self.rec, "segments") else (("final", a) for a in self.rec.utterances())
+        try:
+            for kind, audio in segments:
+                if stop.is_set():
+                    break
+                try:
+                    if kind == "voice":
+                        if self.barge != "off" and getattr(self.speaker, "playing", False):
+                            self.speaker.duck()          # человек заговорил: приглушаем, пока слушаем
+                    elif kind == "drop":
+                        draft = None
+                        self.speaker_unduck()
+                    elif kind == "draft":
+                        draft = (len(audio), pool.submit(self.stt.transcribe, audio))
+                    elif kind == "final":
+                        if draft is not None and draft[0] == len(audio):
+                            text = draft[1].result(timeout=60)
+                        else:
+                            text = pool.submit(self.stt.transcribe, audio).result(timeout=60)
+                        draft = None
+                        self.on_heard(text)
+                except Exception:  # noqa: BLE001 — одна плохая фраза не должна валить ассистента
+                    draft = None
+                    log.exception("Сбой при обработке фразы")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
+STOP_RE = re.compile(r"^(?:джарвис\s+)?(?:стоп|хватит|замолчи|помолчи|тихо|тише говори|остановись|перестань|"
+                     r"достаточно|отмена|отбои|ладно хватит|всё|все стоп)(?:\s+пожалуиста)?$")
 
 
 # --------------------------------------------------------------------------

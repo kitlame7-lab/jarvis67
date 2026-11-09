@@ -115,6 +115,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.minimized or window.tray is None:
         window.show()
     if not args.no_voice and not args.smoke:
+        ctx.service.start_telegram()
         ctx.service.start()
     if args.smoke:
         QTimer.singleShot(1500, app.quit)

@@ -10,12 +10,12 @@ from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QVBoxLayout, QWidget
 
-from .. import backend, diag, tasks, trace
+from .. import backend, diag, routines, tasks, trace
 from ..core import load_settings
 from . import theme
 from .common import Card, Page, Status, background, field, note
 from .pages import ModelPage, button, primary, set_combo
-from .pages2 import LogPage, TelegramPage
+from .pages2 import LogPage
 
 
 def _last_run(task: tasks.Task) -> str:
@@ -59,6 +59,8 @@ class TasksPage(Page):
         rec.add(self.rec_status)
         self.col.addWidget(rec)
 
+        self.build_routines()
+
         self.list_holder = QWidget()
         self.list_lay = QVBoxLayout(self.list_holder)
         self.list_lay.setContentsMargins(0, 0, 0, 0)
@@ -73,6 +75,75 @@ class TasksPage(Page):
         self.btn_cancel.clicked.connect(self.cancel_recording)
         self._pending_delete: Optional[str] = None
         self.on_recording(False)
+
+    # --- шаблоны рутин ------------------------------------------------------------
+    def build_routines(self) -> None:
+        card = Card("Шаблоны рутин",
+                    "Список шагов обычными словами — Джарвис выполнит их по порядку. Запуск: «Джарвис, выполни шаблон "
+                    "утро», в Telegram — /run утро. Можно подставлять {дата}, {вчера}, {время}, {1}.")
+        self.r_pick = QComboBox()
+        card.add(field("Шаблон", self.r_pick))
+        self.r_name = QLineEdit()
+        self.r_name.setPlaceholderText("Например: утро")
+        card.add(field("Название", self.r_name))
+        self.r_text = QPlainTextEdit()
+        self.r_text.setPlaceholderText(routines.EXAMPLE)
+        self.r_text.setMinimumHeight(150)
+        card.add(field("Шаги (каждый с новой строки, начиная с «-»)", self.r_text))
+        self.r_save = primary("Сохранить шаблон")
+        self.r_run = button("Выполнить сейчас")
+        self.r_del = button("Удалить")
+        card.row(self.r_save, self.r_run, self.r_del)
+        self.r_status = Status()
+        card.add(self.r_status)
+        self.col.addWidget(card)
+        self.r_pick.currentIndexChanged.connect(self.pick_routine)
+        self.r_save.clicked.connect(self.save_routine)
+        self.r_run.clicked.connect(self.run_routine)
+        self.r_del.clicked.connect(self.delete_routine)
+
+    def load_routines(self, select: str = "") -> None:
+        self.r_pick.blockSignals(True)
+        self.r_pick.clear()
+        self.r_pick.addItem("Новый шаблон", "")
+        for r in routines.load_all():
+            self.r_pick.addItem(f"{r.name} — {len(r.steps)} шаг.", r.path.stem if r.path else r.name)
+        self.r_pick.setCurrentIndex(max(0, self.r_pick.findData(select)))
+        self.r_pick.blockSignals(False)
+        self.pick_routine()
+
+    def pick_routine(self) -> None:
+        key = self.r_pick.currentData() or ""
+        r = routines.find(key) if key else None
+        self.r_name.setText(r.path.stem if r and r.path else "")
+        self.r_text.setPlainText(r.text if r else "")
+
+    def save_routine(self) -> None:
+        name, text = self.r_name.text().strip(), self.r_text.toPlainText().strip()
+        r = routines.parse(name, text)
+        if not name or not r.steps:
+            self.r_status.bad("Нужны название и хотя бы один шаг.")
+            return
+        old = self.r_pick.currentData() or ""
+        saved = routines.save(name, text)
+        if old and old != saved.path.stem:
+            (routines.routines_dir() / f"{old}.md").unlink(missing_ok=True)
+        self.load_routines(saved.path.stem)
+        self.r_status.ok(f"Сохранено: «{saved.name}», шагов {len(saved.steps)}.")
+
+    def run_routine(self) -> None:
+        name = self.r_name.text().strip()
+        if not name or routines.find(name) is None:
+            self.r_status.bad("Сначала сохраните шаблон.")
+            return
+        self.r_status.info("Выполняю… Ответ появится на главной.")
+        self.ctx.service.ask_text(f"выполни шаблон {name}", speak=True)
+
+    def delete_routine(self) -> None:
+        key = self.r_pick.currentData() or ""
+        if key and routines.delete(key):
+            self.load_routines()
+            self.r_status.ok("Шаблон удалён.")
 
     # --- запись ------------------------------------------------------------------
     def start_recording(self) -> None:
@@ -124,6 +195,7 @@ class TasksPage(Page):
 
     # --- список ----------------------------------------------------------------------
     def load(self) -> None:
+        self.load_routines(self.r_pick.currentData() or "")
         self.reload()
 
     def reload(self) -> None:
@@ -191,9 +263,9 @@ class TasksPage(Page):
 # Подключения: модель и Telegram на одной странице
 # --------------------------------------------------------------------------
 
-class ConnectionsPage(ModelPage, TelegramPage):
+class ConnectionsPage(ModelPage):
     title = "Подключения"
-    lead = ("Откуда Джарвис берёт ум (модель) и как с ним связаться с телефона (Telegram). "
+    lead = ("Откуда Джарвис берёт ум: модель и движок ответов. Telegram — в отдельном разделе. "
             "Ключи сохраняются в самом Hermes: вставлять их нужно только здесь, в окне программы.")
     ENGINES = [("auto", "Авто: быстрый встроенный, если модель настроена"), ("native", "Встроенный (быстрый)"),
                ("hermes", "Только Hermes (медленнее)")]
@@ -210,7 +282,6 @@ class ConnectionsPage(ModelPage, TelegramPage):
         card.add(self.engine_note)
         self.col.addWidget(card)
         ModelPage.build(self)
-        TelegramPage.build(self)
         self.engine.currentIndexChanged.connect(self.save_engine)
 
     def load(self) -> None:
@@ -218,7 +289,6 @@ class ConnectionsPage(ModelPage, TelegramPage):
         set_combo(self.engine, load_settings().get("engine", {}).get("mode", "auto"))
         self.engine.blockSignals(False)
         ModelPage.load(self)
-        TelegramPage.load(self)
 
     def save_engine(self) -> None:
         backend.save_settings({"engine": {"mode": self.engine.currentData()}})
