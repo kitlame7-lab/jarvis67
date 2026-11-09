@@ -27,8 +27,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as dt
+import difflib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -37,7 +40,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 IS_WIN = sys.platform == "win32"
 DRY = os.environ.get("JARVIS_DRYRUN") == "1"
@@ -948,6 +951,498 @@ def cmd_notify(a) -> str:
 
 
 # --------------------------------------------------------------------------
+# Задачи, записанные по действиям пользователя
+# --------------------------------------------------------------------------
+# Формат и поиск совпадают с jarvis/tasks.py (это проверяет тест). Записывает задачи приложение Джарвис,
+# здесь они только читаются и воспроизводятся.
+
+KEY_VK: Dict[str, int] = {
+    "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "space": 0x20, "pageup": 0x21, "pagedown": 0x22,
+    "end": 0x23, "home": 0x24, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28, "insert": 0x2D,
+    "delete": 0x2E, "win": 0x5B, "shift": 0x10, "ctrl": 0x11, "alt": 0x12, "capslock": 0x14,
+    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF, "`": 0xC0, "[": 0xDB, "\\": 0xDC,
+    "]": 0xDD, "'": 0xDE,
+}
+for _i in range(10):
+    KEY_VK[str(_i)] = 0x30 + _i
+for _i in range(26):
+    KEY_VK[chr(ord("a") + _i)] = 0x41 + _i
+for _i in range(1, 13):
+    KEY_VK[f"f{_i}"] = 0x6F + _i
+EXTENDED_VKS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B}
+SIZE_TOLERANCE = 0.25            # окно изменилось по размеру сильнее — координаты берутся от экрана
+ABORT_VK = 0x1B                  # Esc прерывает выполнение задачи
+
+
+def tasks_dir() -> Path:
+    env = os.environ.get("JARVIS_TASKS")
+    if env:
+        return Path(env)
+    path = settings_path()
+    return (path.parent if path else Path.home()) / "tasks"
+
+
+def load_tasks(root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    root = root or tasks_dir()
+    out: List[Dict[str, Any]] = []
+    if root.is_dir():
+        for folder in sorted(root.iterdir()):
+            if not folder.is_dir() or folder.name.startswith("_"):
+                continue
+            try:
+                data = json.loads((folder / "task.json").read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and isinstance(data.get("steps"), list):
+                data["slug"] = str(data.get("slug") or folder.name)
+                data["_dir"] = str(folder)
+                out.append(data)
+    return sorted(out, key=lambda t: str(t.get("created", "")), reverse=True)
+
+
+def _tnorm(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (text or "").lower().replace("ё", "е"))).strip()
+
+
+def find_task(query: str, items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Название или фраза вызова: точно, по вхождению, затем нечётко (как jarvis.tasks.find_task)."""
+    q = _tnorm(query)
+    if not q:
+        return None
+    labels = [(t, [_tnorm(t.get("name", "")), _tnorm(t.get("slug", ""))] + [_tnorm(p) for p in t.get("phrases", [])])
+              for t in items]
+    for t, names in labels:
+        if q in names:
+            return t
+    for t, names in labels:
+        if any(q in n or n in q for n in names if n):
+            return t
+    best, score = None, 0.0
+    for t, names in labels:
+        for n in names:
+            r = difflib.SequenceMatcher(None, q, n).ratio() if n else 0.0
+            if r > score:
+                best, score = t, r
+    return best if score >= 0.62 else None
+
+
+def describe_task_step(step: Dict[str, Any]) -> str:
+    k = step.get("kind")
+    if k == "window":
+        return f"программа {step.get('process') or '?'}"
+    if k == "click":
+        return ("двойной щелчок" if step.get("double") else "щелчок") + f" ({step.get('button', 'left')})"
+    if k == "drag":
+        return "перетаскивание"
+    if k == "type":
+        return "секретный ввод" if step.get("secret") else f"ввод текста, {step.get('length', 0)} симв."
+    if k == "key":
+        return f"клавиша {step.get('key')}" + (f" ×{step['count']}" if step.get("count", 1) > 1 else "")
+    if k == "hotkey":
+        return "сочетание " + "+".join(step.get("keys", []))
+    return str(k)
+
+
+class DryInput:
+    """Ничего не делает, а только записывает действия: для проверки и для не-Windows."""
+
+    def __init__(self) -> None:
+        self.log: List[Any] = []
+        self.wins: List[Dict[str, Any]] = []
+
+    def _note(self, *what: Any) -> None:
+        self.log.append(what)
+        print("[сухой прогон]", *what, file=sys.stderr)
+
+    def screen_size(self): return (1920, 1080)
+    def windows(self): return list(self.wins)
+    def foreground(self): return None
+    def focus(self, win): self._note("окно", win.get("title"))
+    def launch(self, process): self._note("запуск", process); return False
+    def click(self, x, y, button="left", double=False): self._note("щелчок", x, y, button, double)
+    def drag(self, x1, y1, x2, y2, button="left"): self._note("перетаскивание", x1, y1, x2, y2)
+    def type_text(self, text): self._note("ввод", len(text))
+    def key(self, name, count=1): self._note("клавиша", name, count)
+    def hotkey(self, keys): self._note("сочетание", "+".join(keys))
+    def abort_requested(self): return False
+
+
+class Win32Input:
+    """Настоящий ввод через SendInput. Процесс должен быть DPI-aware, иначе координаты съедут на масштабируемых экранах."""
+
+    def __init__(self) -> None:
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+        self.u32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        try:
+            self.u32.SetProcessDPIAware()
+        except OSError:
+            pass
+        ulong_ptr = ctypes.c_size_t
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ulong_ptr)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ulong_ptr)]
+
+        class UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", UNION)]
+        self.MOUSEINPUT, self.KEYBDINPUT, self.INPUT = MOUSEINPUT, KEYBDINPUT, INPUT
+        self.u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        self.u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        self.u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        self.u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        self.u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        self.u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.u32.IsIconic.argtypes = [wintypes.HWND]
+        self.u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        self.u32.GetForegroundWindow.restype = wintypes.HWND
+        self.k32.OpenProcess.restype = wintypes.HANDLE
+        self.k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                        ctypes.POINTER(wintypes.DWORD)]
+        self.k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.u32.GetAsyncKeyState.restype = ctypes.c_short
+
+    # --- отправка ввода -------------------------------------------------------
+    def _send(self, *items) -> None:
+        arr = (self.INPUT * len(items))(*items)
+        sent = self.u32.SendInput(len(items), arr, ctypes.sizeof(self.INPUT))
+        if sent != len(items):
+            raise ToolError("Windows не принял ввод (возможно, окно запущено от администратора).")
+
+    def _mouse(self, flags: int, data: int = 0):
+        i = self.INPUT(0)
+        i.u.mi = self.MOUSEINPUT(0, 0, data, flags, 0, 0)
+        return i
+
+    def _key(self, vk: int = 0, scan: int = 0, flags: int = 0):
+        i = self.INPUT(1)
+        i.u.ki = self.KEYBDINPUT(vk, scan, flags, 0, 0)
+        return i
+
+    def _nudge(self) -> None:
+        """Любой ввод от процесса даёт ему право выводить окна на передний план."""
+        self._send(self._mouse(0x0001))                 # MOUSEEVENTF_MOVE на 0 точек
+
+    # --- экран и окна -----------------------------------------------------------
+    def screen_size(self):
+        return self.u32.GetSystemMetrics(0), self.u32.GetSystemMetrics(1)
+
+    def _proc_name(self, pid: int) -> str:
+        handle = self.k32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(520)
+            size = self.wt.DWORD(520)
+            if self.k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return os.path.basename(buf.value)
+        finally:
+            self.k32.CloseHandle(handle)
+        return ""
+
+    def _describe(self, hwnd) -> Optional[Dict[str, Any]]:
+        if not hwnd:
+            return None
+        title = ctypes.create_unicode_buffer(256)
+        self.u32.GetWindowTextW(hwnd, title, 256)
+        rect = self.wt.RECT()
+        self.u32.GetWindowRect(hwnd, ctypes.byref(rect))
+        pid = self.wt.DWORD()
+        self.u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return {"hwnd": hwnd, "title": title.value, "process": self._proc_name(pid.value),
+                "rect": [rect.left, rect.top, rect.right, rect.bottom]}
+
+    def windows(self) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        callback_t = ctypes.WINFUNCTYPE(ctypes.c_bool, self.wt.HWND, self.wt.LPARAM)
+
+        def visit(hwnd, _lparam):
+            if self.u32.IsWindowVisible(hwnd):
+                info = self._describe(hwnd)
+                if info and info["title"]:
+                    found.append(info)
+            return True
+        self.u32.EnumWindows(callback_t(visit), 0)
+        return found
+
+    def foreground(self) -> Optional[Dict[str, Any]]:
+        return self._describe(self.u32.GetForegroundWindow())
+
+    def focus(self, win: Dict[str, Any]) -> None:
+        hwnd = win["hwnd"]
+        if self.u32.IsIconic(hwnd):
+            self.u32.ShowWindow(hwnd, 9)                # SW_RESTORE
+        self._nudge()
+        self.u32.SetForegroundWindow(hwnd)
+
+    def launch(self, process: str) -> bool:
+        stem = os.path.splitext(process)[0]
+        try:
+            os.startfile(stem)                          # type: ignore[attr-defined]
+            return True
+        except OSError:
+            return False
+
+    # --- действия -----------------------------------------------------------------
+    def click(self, x: int, y: int, button: str = "left", double: bool = False) -> None:
+        down, up = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}[button]
+        self.u32.SetCursorPos(int(x), int(y))
+        time.sleep(0.05)
+        for n in range(2 if double else 1):
+            self._send(self._mouse(down))
+            time.sleep(0.03)
+            self._send(self._mouse(up))
+            if n == 0 and double:
+                time.sleep(0.06)
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: str = "left") -> None:
+        down, up = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}[button]
+        self.u32.SetCursorPos(int(x1), int(y1))
+        time.sleep(0.08)
+        self._send(self._mouse(down))
+        for i in range(1, 13):
+            time.sleep(0.02)
+            self.u32.SetCursorPos(int(x1 + (x2 - x1) * i / 12), int(y1 + (y2 - y1) * i / 12))
+        time.sleep(0.05)
+        self._send(self._mouse(up))
+
+    def type_text(self, text: str) -> None:
+        units = text.encode("utf-16-le")
+        for n in range(0, len(units), 2):
+            code = units[n] | (units[n + 1] << 8)
+            self._send(self._key(0, code, 0x0004), self._key(0, code, 0x0004 | 0x0002))     # UNICODE, затем отпускание
+            time.sleep(0.01)
+
+    def _vk_events(self, vk: int, up: bool):
+        flags = (0x0001 if vk in EXTENDED_VKS else 0) | (0x0002 if up else 0)
+        return self._key(vk, self.u32.MapVirtualKeyW(vk, 0), flags)
+
+    def key(self, name: str, count: int = 1) -> None:
+        vk = KEY_VK.get(name)
+        if vk is None:
+            raise ToolError(f"Неизвестная клавиша «{name}».")
+        for _ in range(max(1, count)):
+            self._send(self._vk_events(vk, False), self._vk_events(vk, True))
+            time.sleep(0.04)
+
+    def hotkey(self, keys: List[str]) -> None:
+        vks = [KEY_VK.get(k) for k in keys]
+        if None in vks:
+            raise ToolError("Неизвестная клавиша в сочетании: " + "+".join(keys))
+        vk_list = [v for v in vks if v is not None]
+        self._send(*[self._vk_events(v, False) for v in vk_list])
+        time.sleep(0.05)
+        self._send(*[self._vk_events(v, True) for v in reversed(vk_list)])
+
+    def abort_requested(self) -> bool:
+        return bool(self.u32.GetAsyncKeyState(ABORT_VK) & 0x8000)
+
+
+class Player:
+    """Воспроизводит шаги задачи. Любая неясность — остановка с понятной причиной, а не угадывание."""
+
+    def __init__(self, io: Any, task: Dict[str, Any], speed: float = 1.0, sleep=time.sleep, clock=time.monotonic):
+        self.io, self.task, self.speed = io, task, max(0.2, min(5.0, speed))
+        self.sleep, self.clock = sleep, clock
+        self._esc_guard = 0.0
+        self.notes: List[str] = []
+
+    # --- ожидание с проверкой прерывания -----------------------------------------
+    def _aborted(self) -> bool:
+        return self.clock() > self._esc_guard and bool(self.io.abort_requested())
+
+    def _wait(self, seconds: float) -> bool:
+        end = self.clock() + seconds
+        while True:
+            if self._aborted():
+                return False
+            left = end - self.clock()
+            if left <= 0:
+                return True
+            self.sleep(min(0.05, left))
+
+    # --- окна ------------------------------------------------------------------
+    def _find_window(self, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        proc = str(ref.get("process", "")).lower()
+        if not proc:
+            return None
+        candidates = [w for w in self.io.windows() if str(w.get("process", "")).lower() == proc]
+        if not candidates:
+            return None
+        title = str(ref.get("title", "")).lower()
+        fg = self.io.foreground()
+
+        def rank(w: Dict[str, Any]):
+            t = str(w.get("title", "")).lower()
+            r = w["rect"]
+            area = max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+            return (t == title and bool(title), bool(title) and (title in t or t in title),
+                    bool(fg) and fg.get("hwnd") == w.get("hwnd"), area)
+        return max(candidates, key=rank)
+
+    def _ensure_window(self, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        win = self._find_window(ref)
+        if win is None:
+            return None
+        fg = self.io.foreground()
+        if not fg or fg.get("hwnd") != win.get("hwnd"):
+            self.io.focus(win)
+            self._wait(0.4)
+            win = self._find_window(ref) or win
+        return win
+
+    def _point(self, step: Dict[str, Any], suffix: str = "") -> Tuple[int, int]:
+        """Экранная точка шага: от окна, если оно такое же по размеру, иначе от экрана."""
+        ref = step.get("window") or {}
+        fx, fy = step.get("x" + suffix), step.get("y" + suffix)
+        win = self._find_window(ref) if fx is not None else None
+        size = step.get("size")
+        if win and fx is not None and fy is not None and size:
+            left, top, right, bottom = win["rect"]
+            w, h = right - left, bottom - top
+            if (w > 0 and h > 0 and abs(w / size[0] - 1) <= SIZE_TOLERANCE and abs(h / size[1] - 1) <= SIZE_TOLERANCE):
+                if suffix == "":
+                    self._ensure_window(ref)
+                    win = self._find_window(ref) or win
+                    left, top, right, bottom = win["rect"]
+                    w, h = right - left, bottom - top
+                return int(left + fx * w), int(top + fy * h)
+        sx, sy = step.get("sx" + suffix), step.get("sy" + suffix)
+        if sx is None or sy is None:
+            raise ToolError("не нашёл окно, в котором нужно щёлкнуть")
+        if win is not None or fx is not None:
+            self.notes.append("окно изменилось, щелчок по положению на экране")
+        sw, sh = self.io.screen_size()
+        return int(sx * sw), int(sy * sh)
+
+    # --- выполнение ------------------------------------------------------------
+    def run(self) -> Tuple[bool, str]:
+        steps = self.task.get("steps", [])
+        name = self.task.get("name", "задача")
+        if not steps:
+            return False, f"В задаче «{name}» нет шагов."
+        total = len(steps)
+        for n, step in enumerate(steps, 1):
+            if not self._wait(float(step.get("delay", 0.5)) / self.speed):
+                return False, f"Остановлено по клавише Esc на шаге {n} из {total}."
+            try:
+                stop = self._do(step)
+            except ToolError as exc:
+                return False, f"Остановился на шаге {n} из {total}: {exc}."
+            if stop:
+                return False, f"Остановился на шаге {n} из {total}: {stop}"
+            if self._aborted():
+                return False, f"Остановлено по клавише Esc на шаге {n} из {total}."
+        tail = f" ({'; '.join(sorted(set(self.notes)))})" if self.notes else ""
+        return True, f"Задача «{name}» выполнена: {total} шагов.{tail}"
+
+    def _do(self, step: Dict[str, Any]) -> str:
+        """Выполняет один шаг. Возвращает причину остановки или пустую строку."""
+        k = step.get("kind")
+        if k == "window":
+            if self._ensure_window(step) is None:
+                if not self.io.launch(str(step.get("process", ""))):
+                    return f"не вижу программу {step.get('process')}. Откройте её и повторите."
+                for _ in range(40):
+                    if not self._wait(0.25):
+                        return "прервано клавишей Esc."
+                    if self._find_window(step):
+                        break
+                else:
+                    return f"программа {step.get('process')} не открылась."
+                self._ensure_window(step)
+            return ""
+        if k == "click":
+            x, y = self._point(step)
+            self.io.click(x, y, step.get("button", "left"), bool(step.get("double")))
+            return ""
+        if k == "drag":
+            x1, y1 = self._point(step)
+            x2, y2 = self._point(step, "2")
+            self.io.drag(x1, y1, x2, y2, step.get("button", "left"))
+            return ""
+        if k == "type":
+            if step.get("secret"):
+                return "здесь нужно ввести секретный текст (пароль). Введите его сами."
+            self.io.type_text(str(step.get("text", "")))
+            return ""
+        if k == "key":
+            if step.get("key") == "esc":
+                self._esc_guard = self.clock() + 0.4
+            self.io.key(str(step.get("key", "")), int(step.get("count", 1)))
+            return ""
+        if k == "hotkey":
+            if "esc" in step.get("keys", []):
+                self._esc_guard = self.clock() + 0.4
+            self.io.hotkey(list(step.get("keys", [])))
+            return ""
+        raise ToolError(f"неизвестный шаг «{k}»")
+
+
+def make_input() -> Any:
+    return Win32Input() if (IS_WIN and not DRY) else DryInput()
+
+
+def _spawn_player(slug: str, speed: float) -> None:
+    exe = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve())]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(exe + ["task", "play", slug, "--speed", str(speed)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
+
+
+def _save_last_run(task: Dict[str, Any], ok: bool, message: str) -> None:
+    try:
+        Path(task["_dir"], "last_run.json").write_text(json.dumps(
+            {"at": dt.datetime.now().isoformat(timespec="seconds"), "ok": ok, "message": message},
+            ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def cmd_task(a) -> str:
+    items = load_tasks()
+    query = " ".join(a.name).strip()
+    if a.action == "list":
+        if not items:
+            return "Записанных задач пока нет. Скажите: «Джарвис, запомни как я это делаю»."
+        lines = [f"{t.get('name')} — {len(t['steps'])} шагов" for t in items]
+        return f"Задач: {len(items)}.\n" + "\n".join(lines)
+    task = find_task(query, items)
+    if task is None:
+        have = ", ".join(str(t.get("name")) for t in items[:6]) or "нет ни одной"
+        raise ToolError(f"Не нашёл задачу «{query}». Есть: {have}.")
+    if a.action == "show":
+        lines = [f"{n}. {describe_task_step(s)}" for n, s in enumerate(task["steps"], 1)]
+        return f"Задача «{task.get('name')}», {len(lines)} шагов:\n" + "\n".join(lines[:40])
+    if a.action == "delete":
+        shutil.rmtree(task["_dir"], ignore_errors=True)
+        return f"Задача «{task.get('name')}» удалена."
+    if a.action == "play" or a.wait:
+        ok, message = Player(make_input(), task, a.speed).run()
+        _save_last_run(task, ok, message)
+        if not ok:
+            raise ToolError(message)
+        return message
+    # run: запускаем отдельным процессом и сразу отвечаем, чтобы Джарвис не молчал всё время выполнения
+    if DRY or not IS_WIN:
+        print(f"[сухой прогон] запуск задачи {task['slug']}", file=sys.stderr)
+    else:
+        _spawn_player(task["slug"], a.speed)
+    return (f"Запустил задачу «{task.get('name')}», {len(task['steps'])} шагов. "
+            "Не трогайте мышь и клавиатуру; чтобы прервать, нажмите Esc.")
+
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -998,6 +1493,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Выполнение команд
     rn = sub.add_parser("run"); rn.add_argument("command", nargs="+"); rn.set_defaults(func=cmd_run)
+
+    # Записанные задачи
+    tk = sub.add_parser("task")
+    tk.add_argument("action", choices=["list", "show", "run", "play", "delete"])
+    tk.add_argument("name", nargs="*")
+    tk.add_argument("--wait", action="store_true")
+    tk.add_argument("--speed", type=float, default=1.0)
+    tk.set_defaults(func=cmd_task)
 
     # Уведомления
     nt = sub.add_parser("notify"); nt.add_argument("text", nargs="+"); nt.set_defaults(func=cmd_notify)

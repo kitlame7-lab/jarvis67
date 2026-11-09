@@ -606,15 +606,19 @@ def skill_target() -> Path:
     return hermes_home() / "skills" / "system" / "jarvis-pc"
 
 
-def pc_command() -> str:
-    """Строка запуска инструментов ПК, которую Hermes подставит в терминал."""
+def pc_argv() -> List[str]:
+    """Как запустить инструменты ПК отдельной программой: [программа] или [python, pc.py]."""
     if FROZEN:
-        return f'"{paths.exe_path().parent / "pc" / "jarvis-pc.exe"}"'.replace("\\", "/")
+        return [str(paths.exe_path().parent / "pc" / "jarvis-pc.exe")]
     exe = paths.exe_path()
     if IS_WIN and exe.name.lower() == "pythonw.exe":
         exe = exe.with_name("python.exe")
-    pc = skill_target() / "scripts" / "pc.py"
-    return f'"{exe}" "{pc}"'.replace("\\", "/")
+    return [str(exe), str(skill_target() / "scripts" / "pc.py")]
+
+
+def pc_command() -> str:
+    """Строка запуска инструментов ПК, которую Hermes подставит в терминал."""
+    return " ".join(f'"{part}"' for part in pc_argv()).replace("\\", "/")
 
 
 def _skill_hash() -> str:

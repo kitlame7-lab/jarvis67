@@ -5,11 +5,12 @@
 в журнал и сообщает окну, а не оставляет человека смотреть на «Загружаюсь…» без объяснений."""
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from . import backend, diag, models
+from . import backend, diag, models, teach, winio
 from .core import (Assistant, Hermes, NullRecorder, Recorder, Speaker, Transcriber, load_settings, log)
 
 # Состояния, которые видит окно
@@ -32,8 +33,12 @@ WATCH_EVERY_S = 2.0
 class AssistantService:
     def __init__(self, on_state: Callable[[str, str], None] = lambda s, d: None,
                  on_event: Callable[[str, str], None] = lambda k, t: None,
-                 on_progress: Callable[[float, str], None] = lambda f, t: None):
+                 on_progress: Callable[[float, str], None] = lambda f, t: None,
+                 on_recording: Callable[[bool], None] = lambda r: None):
         self.on_state, self.on_event, self.on_progress = on_state, on_event, on_progress
+        self.on_recording = on_recording
+        self._teacher: Optional[teach.Teacher] = None
+        self._winapi: Optional[winio.WinApi] = None
         self.state = STOPPED
         self.detail = ""
         self._thread: Optional[threading.Thread] = None
@@ -214,6 +219,7 @@ class AssistantService:
                         log.info("Порог тишины: %.4f", recorder.cfg["silence_threshold"])
                     assistant = Assistant(cfg, self._stt, speaker, hermes, recorder)
                     assistant.on_event = self.on_event
+                    self.attach(assistant)
                     self._assistant = assistant
                     diag.TIMELINE.end()
                     self._set(LISTENING)
@@ -245,6 +251,65 @@ class AssistantService:
             return
         self._set(STOPPED)
 
+    # --- запись действий и задачи ---------------------------------------------
+    @property
+    def teacher(self) -> Optional[teach.Teacher]:
+        """Рекордер создаётся один раз и живёт, пока работает приложение. None, если запись выключена в настройках."""
+        cfg = load_settings()
+        tc = cfg.get("teach", {})
+        if not tc.get("enabled", True):
+            return None
+        if self._teacher is None:
+            hermes_cfg = dict(cfg["hermes"], skills="", yolo=False, timeout_s=90)
+
+            def sampler() -> winio.InputSampler:
+                self._winapi = winio.WinApi()
+                return winio.InputSampler(self._winapi)
+
+            def grab(path: str) -> None:
+                if self._winapi is not None:
+                    self._winapi.grab_jpeg(path)
+
+            self._teacher = teach.Teacher(
+                sampler, ask=Hermes(hermes_cfg).run, grab=grab if tc.get("shots", True) else None,
+                on_done=self._teach_done, on_state=self._teach_state,
+                max_minutes=float(tc.get("max_minutes", 10)), max_shots=int(tc.get("max_shots", 60)),
+                screen=lambda: self._winapi.screen_size() if self._winapi else (1920, 1080))
+        return self._teacher
+
+    def _teach_state(self, recording: bool) -> None:
+        try:
+            self.on_recording(recording)
+        except Exception:  # noqa: BLE001
+            log.exception("Сбой обработчика записи")
+
+    def _teach_done(self, task: Any, message: str) -> None:
+        if task is None and self._teacher is not None and self._teacher.last_error:
+            diag.record_error("запись действий", self._teacher.last_error)
+        assistant = self._assistant
+        if assistant is not None:
+            assistant.notify(message)
+        else:
+            self.on_event("reply", message)
+
+    def run_task(self, task: Any) -> str:
+        """Запускает записанную задачу через jarvis-pc и возвращает, что сказать пользователю."""
+        try:
+            proc = subprocess.run(backend.pc_argv() + ["task", "run", task.slug], capture_output=True, timeout=20,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            diag.record_error("запуск задачи", f"{type(exc).__name__}: {exc}")
+            return "Не получилось запустить задачу. Подробности в диагностике."
+        out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        if proc.returncode != 0:
+            return out or "Не получилось запустить задачу."
+        return out
+
+    def attach(self, assistant: Assistant) -> None:
+        """Подключает к ассистенту запись действий и запуск задач."""
+        assistant.teach = self.teacher
+        assistant.task_runner = self.run_task
+
     # --- текстовый режим (поле на главной) -------------------------------
     def ask_text(self, text: str, speak: bool = False) -> None:
         """Отправляет просьбу агенту без микрофона. Ответ придёт событием reply."""
@@ -254,7 +319,21 @@ class AssistantService:
             speaker = Speaker(cfg["tts"])
             assistant = self._assistant or Assistant(cfg, None, speaker, hermes, NullRecorder())
             assistant.on_event = self.on_event
+            if assistant.teach is None:
+                self.attach(assistant)
             self.on_event("heard", text)
+            from . import intents
+            intent = intents.parse(text, recording=bool(assistant.teach and assistant.teach.recording))
+            if intent:                       # запись действий и запуск задач обрабатываются без нейросети
+                reply = assistant.handle_intent(intent)
+                self.on_event("reply", reply)
+                if speak:
+                    assistant.rec.mute()
+                    try:
+                        speaker.say(reply)
+                    finally:
+                        assistant.rec.unmute()
+                return
             ok, reply = hermes.run(assistant.build_prompt(text))
             if ok:
                 assistant.remember(text, reply)

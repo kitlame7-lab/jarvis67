@@ -103,6 +103,12 @@ DEFAULTS: Dict[str, Any] = {
         "yolo": True,
         "extra_args": [],
     },
+    "teach": {
+        "enabled": True,             # запись действий и повтор задач
+        "max_minutes": 10,           # запись сама остановится
+        "shots": True,               # снимки экрана при щелчках (видны на странице «Задачи»)
+        "max_shots": 60,
+    },
     "updates": {"auto_check": True},
     "history_turns": 6,
     "history_ttl_s": 600,
@@ -158,6 +164,7 @@ def setup_logging(console: bool = False) -> None:
 def normalize(text: str) -> str:
     """Вид, удобный для СРАВНЕНИЯ (й->и, ё->е). Для передачи агенту не годится."""
     text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))   # й->и, ё->е без лишних пробелов
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -671,7 +678,8 @@ PERSONA = (
     "файлы (поиск, список, перемещение, копирование, удаление, размер), процессы "
     "(список, завершение), системная информация (CPU, память, диск, батарея, сеть), "
     "буфер обмена, скриншоты, запуск программ и команд, погода, курсы валют, "
-    "громкость, окна, таймер выключения, игровой режим, уведомления. Используй эти "
+    "громкость, окна, таймер выключения, игровой режим, уведомления, повтор записанных "
+    "задач (команда task). Используй эти "
     "инструменты активно — не говори «я не могу», если команда есть в навыке.\n\n"
     "ПРАВИЛА:\n"
     "- Не выдумывай результат: если действие не удалось, скажи прямо.\n"
@@ -692,6 +700,9 @@ class Assistant:
         self.pool = ThreadPoolExecutor(max_workers=1)
         # Подписка для окна: (вид, текст), где вид — heard / reply / error
         self.on_event: Callable[[str, str], None] = lambda kind, text: None
+        # Запись действий и запуск задач подключает служба; без них голосовые команды записи отвечают отказом
+        self.teach: Optional[Any] = None
+        self.task_runner: Optional[Callable[[Any], str]] = None
 
     def _event(self, kind: str, text: str) -> None:
         try:
@@ -745,11 +756,61 @@ class Assistant:
             self.last_reply_at = time.time()
 
     # --- обработка фразы ------------------------------------------------
+    def handle_intent(self, intent: Any) -> str:
+        """Выполняет команду самого Джарвиса (запись действий, запуск задачи) и возвращает, что сказать."""
+        from . import tasks
+        a, teach = self.address, self.teach
+        if intent.kind == "teach_start":
+            if teach is None:
+                return f"Запись действий здесь недоступна, {a}."
+            if teach.recording:
+                return f"Запись уже идёт, {a}. Скажите «стоп», когда закончите."
+            if not teach.start(intent.arg):
+                return f"Не получилось начать запись, {a}. Подробности в разделе «Диагностика»."
+            return f"Начинаю запись, {a}. Делайте то, что нужно повторить, и скажите «стоп», когда закончите."
+        if intent.kind == "teach_stop":
+            if teach is None or not teach.recording:
+                return f"Сейчас запись не идёт, {a}."
+            teach.stop(intent.arg)
+            return f"Сохраняю, {a}. Это займёт несколько секунд."
+        if intent.kind == "teach_cancel":
+            if teach is None or not teach.discard():
+                return f"Сейчас запись не идёт, {a}."
+            return f"Запись отменена, {a}."
+        if intent.kind == "task_run":
+            items = tasks.list_tasks()
+            task = tasks.find_task(intent.arg, items)
+            if task is None:
+                have = ", ".join(t.name for t in items[:5])
+                return (f"Не нашёл такой задачи, {a}. Есть: {have}." if items
+                        else f"Записанных задач пока нет, {a}. Скажите: запомни, как я это делаю.")
+            if self.task_runner is None:
+                return f"Запуск задач здесь недоступен, {a}."
+            return self.task_runner(task)
+        return ""
+
+    def _run_intent(self, intent: Any, text: str) -> str:
+        log.info("Вы: %s (команда %s)", text, intent.kind)
+        self._event("heard", text)
+        reply = self.handle_intent(intent)
+        self.speak(reply)
+        self.last_reply_at = time.time()
+        return reply
+
+    def notify(self, text: str) -> None:
+        """Озвучивает сообщение из фонового потока (например, «задача готова»), не перебивая текущий ответ."""
+        self.pool.submit(self.speak, text)
+
     def handle_transcript(self, text: str) -> Optional[str]:
         """Возвращает ответ, если фраза была обращена к ассистенту."""
+        from . import intents
         text = (text or "").strip()
         if not text or is_hallucination(text):
             return None
+        if self.teach is not None and self.teach.recording:
+            # Во время записи слушаем только «стоп» и «отмена»: остальные слова не должны запускать действия
+            intent = intents.parse(text, recording=True)
+            return self._run_intent(intent, text) if intent else None
         wake = self.cfg["wake"]
         hit = detect_wake(text, wake["words"], float(wake["fuzzy_ratio"]))
         in_window = (time.time() - self.last_reply_at) < float(wake["followup_seconds"])
@@ -758,9 +819,11 @@ class Assistant:
                 self.speak(f"Слушаю, {self.address}.")
                 self.last_reply_at = time.time()
                 return ""
-            return self.answer(hit.command)
+            intent = intents.parse(hit.command)
+            return self._run_intent(intent, hit.command) if intent else self.answer(hit.command)
         if in_window and len(normalize(text).split()) >= 2:
-            return self.answer(text)
+            intent = intents.parse(text)
+            return self._run_intent(intent, text) if intent else self.answer(text)
         return None
 
     def greet(self) -> None:
