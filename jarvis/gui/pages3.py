@@ -8,12 +8,13 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QVBoxLayout, QWidget
 
-from .. import diag, tasks, trace
+from .. import backend, diag, tasks, trace
+from ..core import load_settings
 from . import theme
 from .common import Card, Page, Status, background, field, note
-from .pages import ModelPage, button, primary
+from .pages import ModelPage, button, primary, set_combo
 from .pages2 import LogPage, TelegramPage
 
 
@@ -192,16 +193,37 @@ class TasksPage(Page):
 
 class ConnectionsPage(ModelPage, TelegramPage):
     title = "Подключения"
-    lead = ("Откуда Джарвис берёт ум (модель Hermes) и как с ним связаться с телефона (Telegram). "
+    lead = ("Откуда Джарвис берёт ум (модель) и как с ним связаться с телефона (Telegram). "
             "Ключи сохраняются в самом Hermes: вставлять их нужно только здесь, в окне программы.")
+    ENGINES = [("auto", "Авто: быстрый встроенный, если модель настроена"), ("native", "Встроенный (быстрый)"),
+               ("hermes", "Только Hermes (медленнее)")]
 
     def build(self) -> None:
+        card = Card("Движок ответов")
+        self.engine = QComboBox()
+        for key, label in self.ENGINES:
+            self.engine.addItem(label, key)
+        card.add(field("Кто отвечает", self.engine,
+                       "Встроенный движок отвечает за несколько секунд и не зависает: он обращается к той же модели напрямую. "
+                       "Hermes остаётся запасным вариантом и нужен для провайдеров, которых встроенный не знает (например, Anthropic)."))
+        self.engine_note = note("")
+        card.add(self.engine_note)
+        self.col.addWidget(card)
         ModelPage.build(self)
         TelegramPage.build(self)
+        self.engine.currentIndexChanged.connect(self.save_engine)
 
     def load(self) -> None:
+        self.engine.blockSignals(True)
+        set_combo(self.engine, load_settings().get("engine", {}).get("mode", "auto"))
+        self.engine.blockSignals(False)
         ModelPage.load(self)
         TelegramPage.load(self)
+
+    def save_engine(self) -> None:
+        backend.save_settings({"engine": {"mode": self.engine.currentData()}})
+        self.engine_note.setText("Сохранено. Джарвис перезапустится и применит выбор.")
+        self.ctx.restart_service_soon()
 
 
 # --------------------------------------------------------------------------

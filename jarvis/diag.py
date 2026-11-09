@@ -269,8 +269,8 @@ def _log_tail(lines: int = 120) -> List[str]:
 def gather(service_state: tuple = ("", ""), net: bool = True, hermes_probe: bool = True,
            network: Optional[Callable[[Dict[str, str]], Dict[str, Dict[str, Any]]]] = None) -> Dict[str, Any]:
     """Собирает всё, что нужно для выводов. Тяжёлое (сеть, Hermes) запускайте не в потоке окна."""
-    from . import backend, models
-    from .core import find_hermes, load_settings
+    from . import backend, llm, models
+    from .core import TIMINGS, find_hermes, load_settings
 
     cfg = load_settings()
     home = backend.hermes_home()
@@ -301,6 +301,9 @@ def gather(service_state: tuple = ("", ""), net: bool = True, hermes_probe: bool
         "hermes": {"exe": exe, "version": _hermes_version(exe) if (exe and hermes_probe) else "",
                    "provider": now.get("provider", ""), "model": now.get("model", ""),
                    "base_url": safe_url(now.get("base_url", ""))},
+        "engine": {"mode": str(cfg.get("engine", {}).get("mode", "auto")),
+                   "native": llm.resolve_endpoint(cfg) is not None,
+                   "timings": [{"source": src, "seconds": round(sec, 1), "ok": ok} for _, src, sec, ok in list(TIMINGS)[-20:]]},
         "model_cache": {"name": stt_name, "found": bool(cached), "path": cached or str(models.model_dir(stt_name))},
         "mic": {"count": mics, "error": mic_error},
         "service": {"state": service_state[0], "detail": service_state[1]},
@@ -396,6 +399,23 @@ def analyze(data: Dict[str, Any]) -> List[Finding]:
         out.append(Finding("error", "Сервер модели ответов недоступен", f"{srv.get('url', '')}: {srv.get('error', '')}",
                            "Проверьте адрес (Base URL) и интернет. Сайт-поставщик ключа может быть временно недоступен."))
 
+    # --- скорость ответов
+    eng = data.get("engine") or {}
+    if eng and eng.get("mode") != "hermes" and not eng.get("native") and h.get("exe"):
+        out.append(Finding("info", "Отвечает Hermes, а не быстрый встроенный движок",
+                           "Для вашего провайдера встроенный движок не настроен (нет адреса, ключа или модели).",
+                           "Заполните адрес, ключ и модель в разделе «Подключения»: ответы станут заметно быстрее."))
+    slow = sorted(t["seconds"] for t in eng.get("timings", []) if t["source"] in ("hermes", "native") and t["ok"])
+    if len(slow) >= 3 and slow[len(slow) // 2] > 15:
+        via = "Hermes" if not eng.get("native") else "модель"
+        out.append(Finding("warn", f"Ответы медленные: обычно {slow[len(slow) // 2]:.0f} с", f"Отвечает {via}.",
+                           "Выберите «Встроенный» в «Подключения → Движок ответов» или модель побыстрее."
+                           if eng.get("mode") != "native" else "Выберите модель побыстрее (без режима рассуждений)."))
+    lost = sum(1 for t in eng.get("timings", []) if t["source"] == "timeout")
+    if lost >= 2:
+        out.append(Finding("error", f"Ответ не пришёл вовремя {lost} раз", "Запросы к модели зависают.",
+                           "Проверьте баланс и адрес в «Подключения»; при необходимости переключите «Движок ответов»."))
+
     # --- микрофон и голос
     mic = data.get("mic") or {}
     if mic.get("count") == 0:
@@ -443,6 +463,9 @@ def render_text(data: Dict[str, Any], findings: List[Finding]) -> str:
               f"  ассистент: {data['service']['state'] or '—'} {data['service']['detail']}",
               f"  Hermes: {h['exe'] or 'не найден'} {h['version']}; провайдер={h['provider'] or '—'}, модель={h['model'] or '—'}, "
               f"адрес={h['base_url'] or '—'}",
+              f"  движок ответов: {(data.get('engine') or {}).get('mode', '—')}, встроенный готов: "
+              f"{'да' if (data.get('engine') or {}).get('native') else 'нет'}; последние ответы, с: "
+              f"{[(t['source'], t['seconds']) for t in (data.get('engine') or {}).get('timings', [])[-8:]]}",
               f"  модель речи: {data['model_cache']['name']}, на компьютере: {'да' if data['model_cache']['found'] else 'нет'}",
               f"  микрофонов: {data['mic']['count']} {data['mic']['error']}",
               f"  свободно на диске: {p['free_gb']} ГБ; данные: {p['data']}",

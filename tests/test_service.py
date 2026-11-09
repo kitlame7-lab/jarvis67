@@ -115,13 +115,13 @@ class ServiceCase(unittest.TestCase):
 
 class ServiceTests(ServiceCase):
     def test_start_listen_answer_stop(self):
-        FakeRec.feed = ["Джарвис, какая погода"]
+        FakeRec.feed = ["Джарвис, расскажи анекдот"]
         self.svc.start()
         self.assertTrue(self.wait(lambda: any(k == "reply" for k, _ in self.events)), self.events)
         self.assertEqual(self.svc.state, service.LISTENING)
         kinds = [k for k, _ in self.events]
         self.assertEqual(kinds[:2], ["heard", "reply"])
-        self.assertIn("какая погода", self.events[1][1])
+        self.assertIn("расскажи анекдот", self.events[1][1])
         self.svc.stop()
         self.assertEqual(self.svc.state, service.STOPPED)
         self.assertFalse(self.svc.running)

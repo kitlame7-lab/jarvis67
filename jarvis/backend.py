@@ -385,6 +385,10 @@ def sanitize_settings(incoming: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(ui, dict) and ui.get("theme") in ("light", "dark"):
         out["ui"] = {"theme": ui["theme"]}
 
+    eng = incoming.get("engine")
+    if isinstance(eng, dict) and eng.get("mode") in ("auto", "native", "hermes"):
+        out["engine"] = {"mode": eng["mode"]}
+
     w = incoming.get("wake")
     if isinstance(w, dict):
         wo: Dict[str, Any] = {}

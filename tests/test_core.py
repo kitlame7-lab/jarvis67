@@ -27,7 +27,9 @@ def make(over=None):
     if over:
         cfg = deep_merge(cfg, over)
     sp = FakeSpeaker()
-    return Assistant(cfg, None, sp, Hermes(cfg["hermes"]), NullRecorder()), sp
+    a = Assistant(cfg, None, sp, Hermes(cfg["hermes"]), NullRecorder())
+    a.run_pc = lambda tokens: (True, "pc: " + " ".join(tokens))      # настоящие команды Windows в тестах не нужны
+    return a, sp
 
 
 class WakeTests(unittest.TestCase):
@@ -60,7 +62,7 @@ class TextTests(unittest.TestCase):
     def test_hallucination(self):
         self.assertTrue(is_hallucination("Субтитры сделал DimaTorzok"))
         self.assertTrue(is_hallucination("да да да да да"))
-        self.assertFalse(is_hallucination("Джарвис, какая погода"))
+        self.assertFalse(is_hallucination("Джарвис, расскажи анекдот"))
 
     def test_clean_speech(self):
         out = clean_for_speech("**Готово**, сэр! 😀 Смотрите https://x.org `код`")
@@ -120,8 +122,8 @@ class HermesTests(unittest.TestCase):
 class FlowTests(unittest.TestCase):
     def test_wake_with_command(self):
         a, sp = make()
-        self.assertIsNotNone(a.handle_transcript("Джарвис, какая погода"))
-        self.assertTrue(any("какая погода" in s for s in sp.said))
+        self.assertIsNotNone(a.handle_transcript("Джарвис, расскажи анекдот"))
+        self.assertTrue(any("расскажи анекдот" in s for s in sp.said))
 
     def test_events_reach_the_window(self):
         a, _ = make()

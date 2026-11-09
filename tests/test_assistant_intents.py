@@ -1,5 +1,6 @@
 """Голосовые команды записи и запуска задач внутри Assistant (без микрофона и без Hermes)."""
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,7 +89,9 @@ class IntentFlowTests(unittest.TestCase):
 
     def test_notify_speaks_from_background(self):
         self.a.notify("Задача готова")
-        self.a.pool.shutdown(wait=True)
+        end = time.time() + 3
+        while time.time() < end and "Задача готова" not in self.sp.said:
+            time.sleep(0.02)
         self.assertIn("Задача готова", self.sp.said)
 
 

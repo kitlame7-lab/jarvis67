@@ -8,6 +8,7 @@ import pytest
 
 from helpers import STUB
 from jarvis import backend, paths, updater
+from jarvis.core import load_settings
 
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -65,6 +66,17 @@ class WindowTests(GuiBase):
         self.assertEqual(titles, ["Главное", "Задачи", "Голос", "Слух", "Возможности", "Подключения", "Диагностика", "Система"])
         for t in titles:
             page(self.w, t)
+
+    def test_engine_choice_is_saved(self):
+        p = page(self.w, "Подключения")
+        self.assertEqual(p.engine.currentData(), "auto")
+        p.engine.setCurrentIndex(p.engine.findData("hermes"))
+        self.assertEqual(load_settings()["engine"]["mode"], "hermes")
+        page(self.w, "Главное")
+        p = page(self.w, "Подключения")
+        self.assertEqual(p.engine.currentData(), "hermes")
+        p.engine.setCurrentIndex(p.engine.findData("auto"))
+        self.assertEqual(load_settings()["engine"]["mode"], "auto")
 
     def test_no_web_or_eleven_leftovers_in_texts(self):
         from PySide6.QtWidgets import QLabel

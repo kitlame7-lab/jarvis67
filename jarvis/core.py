@@ -24,17 +24,19 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import agent as agent_mod
 from . import models, paths
 from .paths import IS_WIN, LOG_PATH, ensure_dirs
 
@@ -98,7 +100,7 @@ DEFAULTS: Dict[str, Any] = {
         "provider": "",   # пусто = как настроено в самом Hermes
         "model": "",
         "skills": "jarvis-pc",
-        "timeout_s": 300,
+        "timeout_s": 120,
         "ack_after_s": 3.0,
         "yolo": True,
         "extra_args": [],
@@ -108,6 +110,12 @@ DEFAULTS: Dict[str, Any] = {
         "max_minutes": 10,           # запись сама остановится
         "shots": True,               # снимки экрана при щелчках (видны на странице «Задачи»)
         "max_shots": 60,
+    },
+    "engine": {
+        "mode": "auto",              # auto: встроенный движок, если модель настроена; native; hermes
+        "llm_timeout_s": 40,         # ожидание одного ответа модели
+        "max_steps": 5,              # сколько раз подряд модель может запросить команды
+        "deadline_s": 100,           # общий предел на одну просьбу
     },
     "ui": {"theme": "light"},        # light | dark
     "updates": {"auto_check": True},
@@ -285,6 +293,25 @@ def find_hermes(configured: str = "") -> Optional[str]:
     return None
 
 
+def kill_tree(proc: "subprocess.Popen") -> None:
+    """Завершает процесс вместе со всеми потомками и забирает его, чтобы не оставалось зомби."""
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=10,
+                           stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)       # процесс запущен в своей группе (start_new_session)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+
+
 class Hermes:
     """Вызывает `hermes chat --oneshot` и возвращает текст ответа."""
 
@@ -320,13 +347,18 @@ class Hermes:
                 fh.write(prompt)
             env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.run(
-                self.build_argv(path), capture_output=True, text=True,
-                encoding="utf-8", errors="replace", env=env, stdin=subprocess.DEVNULL,
-                timeout=float(self.cfg.get("timeout_s", 300)), creationflags=flags,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "Задача выполняется слишком долго. Подробности смотрите в Hermes."
+            child = subprocess.Popen(
+                self.build_argv(path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", env=env, stdin=subprocess.DEVNULL, creationflags=flags,
+                start_new_session=not IS_WIN)
+            try:
+                stdout, stderr = child.communicate(timeout=float(self.cfg.get("timeout_s", 120)))
+            except subprocess.TimeoutExpired:
+                # Зависший Hermes тащит за собой свои дочерние процессы: убиваем всё дерево, иначе они держат файлы
+                # и следующая просьба тоже зависает
+                kill_tree(child)
+                return False, "Hermes не ответил вовремя и был остановлен. Для быстрых ответов включите встроенный движок в разделе «Подключения»."
+            proc = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
         except OSError as exc:
             log.error("Не удалось запустить Hermes: %s", exc)
             return False, "Не удалось запустить Hermes."
@@ -420,7 +452,7 @@ def list_voices(locale_prefix: str = "ru-") -> List[Dict[str, str]]:
     return list(FALLBACK_VOICES)
 
 
-def play_mp3(path: str, slack_s: float = 5.0) -> None:
+def play_mp3(path: str, slack_s: float = 5.0, cancel: Optional[threading.Event] = None) -> None:
     """Проигрывает mp3 средствами Windows (MCI), без ffmpeg и плееров.
 
     Раньше стояло `play … wait`: при сбое звукового драйвера вызов не возвращался, микрофон оставался заглушённым,
@@ -439,6 +471,8 @@ def play_mp3(path: str, slack_s: float = 5.0) -> None:
             raise RuntimeError(f"не удалось воспроизвести звук (код MCI {err})")
         deadline = time.monotonic() + length_s + slack_s
         while time.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                return
             mci(f"status {alias} mode", buf, 127, None)
             if buf.value == "stopped":
                 return
@@ -466,6 +500,7 @@ class Speaker:
         self.enabled = bool(cfg.get("enabled", True))
         self._down_until = 0.0
         self._choice: Optional[Tuple[str, Optional[str], Optional[str]]] = None
+        self.cancel = threading.Event()      # «Остановить» обрывает речь сразу, а не после последнего слова
 
     def attempts(self) -> List[Tuple[str, Optional[str], Optional[str]]]:
         """Варианты (голос, скорость, высота) от настроенного к самым простым.
@@ -509,7 +544,7 @@ class Speaker:
         os.close(fd)
         try:
             self.synth(text, path)
-            play_mp3(path)
+            play_mp3(path, cancel=self.cancel)
         finally:
             try:
                 os.unlink(path)
@@ -525,7 +560,7 @@ class Speaker:
     def say(self, text: str) -> None:
         speech = clean_for_speech(text, int(self.cfg.get("max_chars", 600)))
         log.info("Джарвис: %s", speech)
-        if not self.enabled or not speech or not IS_WIN:
+        if self.cancel.is_set() or not self.enabled or not speech or not IS_WIN:
             return
         backend = self.cfg.get("backend", "auto")
         if backend in ("auto", "edge", "neural") and time.time() >= self._down_until:
@@ -691,6 +726,17 @@ PERSONA = (
 )
 
 
+# Время последних ответов: (когда, источник, секунды, получилось). Читает «Диагностика», чтобы подсказать про медленный движок
+TIMINGS: "deque[Tuple[float, str, float, bool]]" = deque(maxlen=40)
+
+
+@dataclass
+class Reply:
+    ok: bool
+    text: str
+    source: str          # quick — без нейросети; native — встроенный движок; hermes; timeout
+
+
 class Assistant:
     def __init__(self, cfg: Dict[str, Any], stt: Optional[Transcriber], speaker: Speaker,
                  hermes: Hermes, recorder: Any):
@@ -698,12 +744,22 @@ class Assistant:
         self.address = cfg["address"]
         self.history: List[Tuple[str, str, float]] = []
         self.last_reply_at = 0.0
-        self.pool = ThreadPoolExecutor(max_workers=1)
+        # «Остановить» ставит этот флаг: ожидание ответа и речь обрываются сразу, а не после зависшего запроса
+        self.cancel = threading.Event()
+        # Встроенный движок (jarvis.agent.Agent) подключает служба; без него отвечает Hermes
+        self.agent: Optional[Any] = None
+        self.run_pc: Callable[[List[str]], Tuple[bool, str]] = agent_mod.run_pc
         # Подписка для окна: (вид, текст), где вид — heard / reply / error
         self.on_event: Callable[[str, str], None] = lambda kind, text: None
         # Запись действий и запуск задач подключает служба; без них голосовые команды записи отвечают отказом
         self.teach: Optional[Any] = None
         self.task_runner: Optional[Callable[[Any], str]] = None
+
+    def stop(self) -> None:
+        self.cancel.set()
+        flag = getattr(self.speaker, "cancel", None)
+        if flag is not None:
+            flag.set()
 
     def _event(self, kind: str, text: str) -> None:
         try:
@@ -712,11 +768,14 @@ class Assistant:
             log.exception("Сбой обработчика событий")
 
     # --- контекст -------------------------------------------------------
-    def build_prompt(self, command: str) -> str:
+    def recent(self) -> List[Tuple[str, str, float]]:
         now = time.time()
         ttl = float(self.cfg["history_ttl_s"])
         self.history = [h for h in self.history if now - h[2] < ttl]
-        recent = self.history[-int(self.cfg["history_turns"]):]
+        return self.history[-int(self.cfg["history_turns"]):]
+
+    def build_prompt(self, command: str) -> str:
+        recent = self.recent()
         parts = [PERSONA.format(name=self.cfg["name"], address=self.address)]
         if recent:
             parts.append("Недавний разговор:")
@@ -737,24 +796,82 @@ class Assistant:
         finally:
             self.rec.unmute()
 
+    def think(self, command: str, cancel: Optional[threading.Event] = None) -> Reply:
+        """Находит ответ. Простое выполняется сразу, остальное решает модель; Hermes — запасной путь."""
+        from . import llm, quick          # quick берёт normalize отсюда: импорт внутри функции избегает цикла
+        t0 = time.monotonic()
+        cancel = cancel or self.cancel
+        tokens = quick.match(command)
+        if tokens:
+            refusal = agent_mod.check_allowed(tokens)
+            ok, text = (False, refusal) if refusal else self.run_pc(tokens)
+            reply = Reply(ok, text, "quick")
+        elif self.agent is not None:
+            try:
+                answer = self.agent.ask(command, [(u, r) for u, r, _ in self.recent()], cancel)
+                log.info("Ответ: %d шаг., модель %.1f с, команды %.1f с", answer.steps, answer.llm_s, answer.tools_s)
+                reply = Reply(True, answer.text, "native")
+            except llm.LLMError as exc:
+                reply = Reply(False, str(exc), "native")
+        else:
+            ok, text = self.hermes.run(self.build_prompt(command))
+            reply = Reply(ok, text, "hermes")
+        took = time.monotonic() - t0
+        TIMINGS.append((time.time(), reply.source, took, reply.ok))
+        log.info("Ответ готов за %.1f с (%s, %s)", took, reply.source, "ok" if reply.ok else "сбой")
+        return reply
+
     def answer(self, command: str) -> str:
         log.info("Вы: %s", command)
         self._event("heard", command)
         self.rec.mute()
         try:
-            future = self.pool.submit(self.hermes.ask, self.build_prompt(command))
-            try:
-                reply = future.result(timeout=float(self.cfg["hermes"]["ack_after_s"]))
-            except FutureTimeout:
-                self.speaker.say(f"Одну секунду, {self.address}.")
-                reply = future.result()  # doctor: ok(wait-forever) — у Hermes.run свой предел timeout_s
-            self.remember(command, reply)
-            self._event("reply", reply)
-            self.speaker.say(reply)
-            return reply
+            reply = self._wait_for(command)
+            if reply is None:
+                return ""                                  # нажали «Остановить»
+            if reply.ok:
+                self.remember(command, reply.text)
+            self._event("reply" if reply.ok else "error", reply.text)
+            self.speaker.say(reply.text)
+            return reply.text
         finally:
             self.rec.unmute()
             self.last_reply_at = time.time()
+
+    def _wait_for(self, command: str) -> Optional[Reply]:
+        """Ответ считается в отдельном потоке: зависший запрос не блокирует ни следующую просьбу, ни «Остановить»."""
+        box: List[Reply] = []
+        done = threading.Event()
+        job_cancel = threading.Event()
+
+        def job() -> None:
+            try:
+                box.append(self.think(command, job_cancel))
+            except Exception:  # noqa: BLE001 — неожиданный сбой не должен оставить человека в тишине
+                log.exception("Сбой при поиске ответа")
+                box.append(Reply(False, f"Что-то пошло не так, {self.address}. Подробности в журнале.", "error"))
+            finally:
+                done.set()
+
+        threading.Thread(target=job, name="jarvis-ask", daemon=True).start()
+        started = time.monotonic()
+        ack_after = float(self.cfg["hermes"]["ack_after_s"])
+        deadline = float(self.cfg.get("engine", {}).get("deadline_s", 100))
+        acked = False
+        while not done.wait(0.1):
+            if self.cancel.is_set():
+                job_cancel.set()
+                return None
+            waited = time.monotonic() - started
+            if not acked and waited >= ack_after:
+                acked = True
+                self.speaker.say(f"Одну секунду, {self.address}.")
+            if waited >= deadline:
+                job_cancel.set()
+                TIMINGS.append((time.time(), "timeout", waited, False))
+                return Reply(False, f"Не дождался ответа, {self.address}. Попробуйте ещё раз или откройте «Диагностика».",
+                             "timeout")
+        return box[0]
 
     # --- обработка фразы ------------------------------------------------
     def handle_intent(self, intent: Any) -> str:
@@ -799,8 +916,8 @@ class Assistant:
         return reply
 
     def notify(self, text: str) -> None:
-        """Озвучивает сообщение из фонового потока (например, «задача готова»), не перебивая текущий ответ."""
-        self.pool.submit(self.speak, text)
+        """Озвучивает сообщение из фонового потока (например, «задача готова»)."""
+        threading.Thread(target=self.speak, args=(text,), name="jarvis-notify", daemon=True).start()
 
     def handle_transcript(self, text: str) -> Optional[str]:
         """Возвращает ответ, если фраза была обращена к ассистенту."""

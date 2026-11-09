@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from . import backend, diag, models, teach, winio
+from . import agent, backend, diag, models, teach, winio
 from .core import (Assistant, Hermes, NullRecorder, Recorder, Speaker, Transcriber, load_settings, log)
 
 # Состояния, которые видит окно
@@ -102,6 +102,9 @@ class AssistantService:
             if rec is not None:
                 rec.stop.set()
             th = self._thread
+            assistant = self._assistant
+        if assistant is not None:
+            assistant.stop()                 # обрывает ожидание ответа и речь: поток не застрянет на зависшем запросе
         if th is not None and th is not threading.current_thread():
             th.join(wait)
         self._progress(-1.0, "")
@@ -217,9 +220,7 @@ class AssistantService:
                         self._set(LOADING, "Замеряю шум в комнате")
                         recorder.cfg["silence_threshold"] = recorder.calibrate()
                         log.info("Порог тишины: %.4f", recorder.cfg["silence_threshold"])
-                    assistant = Assistant(cfg, self._stt, speaker, hermes, recorder)
-                    assistant.on_event = self.on_event
-                    self.attach(assistant)
+                    assistant = self.make_assistant(cfg, self._stt, speaker, hermes, recorder)
                     self._assistant = assistant
                     diag.TIMELINE.end()
                     self._set(LISTENING)
@@ -236,6 +237,7 @@ class AssistantService:
                     self.on_event("error", f"Микрофон или звук: {exc}")
                     stop.wait(5)
                 finally:
+                    self._assistant = None
                     if recorder is not None:
                         try:
                             recorder.close()
@@ -306,6 +308,18 @@ class AssistantService:
             return out or "Не получилось запустить задачу."
         return out
 
+    def make_assistant(self, cfg: Dict[str, Any], stt: Any, speaker: Any, hermes: Hermes, rec: Any) -> Assistant:
+        assistant = Assistant(cfg, stt, speaker, hermes, rec)
+        assistant.on_event = self.on_event
+        try:
+            assistant.agent = agent.make_agent(cfg)
+        except Exception as exc:  # noqa: BLE001 — без встроенного движка отвечает Hermes
+            log.exception("Встроенный движок не подготовился")
+            diag.record_error("встроенный движок", f"{type(exc).__name__}: {exc}")
+        log.info("Движок ответов: %s", "встроенный (%s)" % assistant.agent.endpoint.label if assistant.agent else "Hermes")
+        self.attach(assistant)
+        return assistant
+
     def attach(self, assistant: Assistant) -> None:
         """Подключает к ассистенту запись действий и запуск задач."""
         assistant.teach = self.teacher
@@ -318,35 +332,24 @@ class AssistantService:
             cfg = load_settings()
             hermes = Hermes(cfg["hermes"])
             speaker = Speaker(cfg["tts"])
-            assistant = self._assistant or Assistant(cfg, None, speaker, hermes, NullRecorder())
-            assistant.on_event = self.on_event
-            if assistant.teach is None:
-                self.attach(assistant)
+            assistant = self._assistant or self.make_assistant(cfg, None, speaker, hermes, NullRecorder())
             self.on_event("heard", text)
             from . import intents
             intent = intents.parse(text, recording=bool(assistant.teach and assistant.teach.recording))
             if intent:                       # запись действий и запуск задач обрабатываются без нейросети
-                reply = assistant.handle_intent(intent)
-                self.on_event("reply", reply)
-                if speak:
-                    assistant.rec.mute()
-                    try:
-                        speaker.say(reply)
-                    finally:
-                        assistant.rec.unmute()
-                return
-            ok, reply = hermes.run(assistant.build_prompt(text))
-            if ok:
-                assistant.remember(text, reply)
-                self.on_event("reply", reply)
-                if speak:
-                    assistant.rec.mute()
-                    try:
-                        speaker.say(reply)
-                    finally:
-                        assistant.rec.unmute()
+                ok, reply = True, assistant.handle_intent(intent)
             else:
-                self.on_event("error", reply)
+                result = assistant.think(text)
+                ok, reply = result.ok, result.text
+                if ok:
+                    assistant.remember(text, reply)
+            self.on_event("reply" if ok else "error", reply)
+            if speak:
+                assistant.rec.mute()
+                try:
+                    speaker.say(reply)
+                finally:
+                    assistant.rec.unmute()
 
         threading.Thread(target=work, name="jarvis-chat", daemon=True).start()
 
