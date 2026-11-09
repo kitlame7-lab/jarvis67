@@ -1,4 +1,4 @@
-"""Страницы: Главное, Модель, Голос, Слух, Возможности."""
+"""Страницы: Главное, Модель (часть «Подключений»), Голос, Слух, Возможности."""
 from __future__ import annotations
 
 from typing import Dict, List
@@ -44,7 +44,7 @@ def set_combo(box: QComboBox, data: str, fallback_text: str = "") -> None:
 
 class HomePage(Page):
     title = "Главное"
-    lead = "Скажите «Джарвис» и попросите что угодно. Здесь видно, что он слышит и отвечает."
+    lead = "Скажите «Джарвис» и попросите что угодно. Или напишите просьбу ниже: это то же самое, только текстом."
 
     def build(self) -> None:
         card = Card()
@@ -64,7 +64,26 @@ class HomePage(Page):
         self.btn_restart = button("Перезапустить")
         self.btn_stop = button("Остановить", "danger")
         card.row(self.btn_start, self.btn_pause, self.btn_restart, self.btn_stop)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.hide()
+        card.add(self.progress)
         self.col.addWidget(card)
+
+        ask = Card("Написать Джарвису")
+        row = QHBoxLayout()
+        self.cmd = QLineEdit()
+        self.cmd.setPlaceholderText("Например: найди файл «отчёт» или выполни задачу «утренний запуск»")
+        self.btn_send = primary("Отправить")
+        row.addWidget(self.cmd, 1)
+        row.addWidget(self.btn_send)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        ask.add(wrap)
+        self.speak = QCheckBox("Озвучивать ответ")
+        ask.add(self.speak)
+        self.col.addWidget(ask)
+        self.busy = False
 
         talk = Card("Последний разговор")
         self.heard = QLabel("—")
@@ -88,10 +107,31 @@ class HomePage(Page):
         self.btn_stop.clicked.connect(self.ctx.service.stop)
         self.btn_restart.clicked.connect(self.ctx.restart_service)
         self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_send.clicked.connect(self.submit)
+        self.cmd.returnPressed.connect(self.submit)
         self.autostart.toggled.connect(self.set_autostart)
         self.greeting.toggled.connect(self.set_greeting)
         self._loading = False
         self.on_state(self.ctx.service.state, "")
+
+    def submit(self) -> None:
+        text = self.cmd.text().strip()
+        if not text or self.busy:
+            return
+        self.cmd.clear()
+        self._set_busy(True)
+        self.ctx.service.ask_text(text, speak=self.speak.isChecked())
+
+    def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.btn_send.setEnabled(not busy)
+        self.btn_send.setText("Думаю…" if busy else "Отправить")
+
+    def on_progress(self, fraction: float, text: str) -> None:
+        shown = 0.0 <= fraction <= 1.0
+        self.progress.setVisible(shown)
+        if shown:
+            self.progress.setValue(int(fraction * 1000))
 
     def toggle_pause(self) -> None:
         self.ctx.service.set_paused(self.ctx.service.state != service.PAUSED)
@@ -134,8 +174,10 @@ class HomePage(Page):
             self.heard.setText(text)
         elif kind == "reply":
             self.reply.setText(text)
+            self._set_busy(False)
         elif kind == "error":
             self.reply.setText(f"⚠ {text}")
+            self._set_busy(False)
 
 
 # --------------------------------------------------------------------------

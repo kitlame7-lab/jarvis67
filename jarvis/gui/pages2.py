@@ -1,4 +1,4 @@
-"""Страницы: Telegram, Чат, Журнал, Система."""
+"""Страницы: Telegram (часть «Подключений»), Журнал, Система."""
 from __future__ import annotations
 
 import html
@@ -9,8 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QTextBrowser,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QWidget)
 
 from .. import REPO, __version__, backend, core, paths
 from . import theme
@@ -33,12 +32,11 @@ def open_folder(path: Path) -> None:
 # --------------------------------------------------------------------------
 
 class TelegramPage(Page):
-    title = "Telegram"
-    lead = ("Через Telegram Джарвису можно писать с телефона: он ответит так же, как на голос. "
-            "Работает через шлюз Hermes, который запускается отдельно.")
+    """Часть страницы «Подключения»: Telegram-бот, через которого можно писать Джарвису с телефона."""
 
     def build(self) -> None:
-        card = Card("Бот")
+        card = Card("Telegram: писать Джарвису с телефона",
+                    "Бот отвечает так же, как на голос. Работает через шлюз Hermes, который запускается отдельно.")
         self.token = SecretEdit("123456:ABC…")
         card.add(field("Токен бота", self.token, "Создайте бота у @BotFather в Telegram командой /newbot и скопируйте токен."))
         self.token_state = note("")
@@ -50,103 +48,48 @@ class TelegramPage(Page):
         self.col.addWidget(card)
 
         act = Card()
-        self.btn_save = button("Сохранить")
-        self.btn_apply = primary("Сохранить и перезапустить шлюз")
-        act.row(self.btn_save, self.btn_apply)
-        self.status = Status()
-        act.add(self.status)
-        self.out = QPlainTextEdit()
-        self.out.setReadOnly(True)
-        self.out.setMaximumHeight(160)
-        self.out.hide()
-        act.add(self.out)
+        self.tg_save = button("Сохранить")
+        self.tg_apply = primary("Сохранить и перезапустить шлюз")
+        act.row(self.tg_save, self.tg_apply)
+        self.tg_status = Status()
+        act.add(self.tg_status)
+        self.tg_out = QPlainTextEdit()
+        self.tg_out.setReadOnly(True)
+        self.tg_out.setMaximumHeight(160)
+        self.tg_out.hide()
+        act.add(self.tg_out)
         self.col.addWidget(act)
-        self.btn_save.clicked.connect(lambda: self.save(False))
-        self.btn_apply.clicked.connect(lambda: self.save(True))
+        self.tg_save.clicked.connect(lambda: self.save_tg(False))
+        self.tg_apply.clicked.connect(lambda: self.save_tg(True))
 
     def load(self) -> None:
         snap = backend.hermes_snapshot()
         self.token_state.setText(self.token.describe(snap["telegram"]["token"]))
         self.users.setText(snap["telegram"]["users"])
 
-    def save(self, restart: bool) -> None:
+    def save_tg(self, restart: bool) -> None:
         try:
             backend.save_telegram(self.token.value(), self.users.text())
         except ValueError as exc:
-            self.status.bad(str(exc))
+            self.tg_status.bad(str(exc))
             return
         self.token.clear()
         self.load()
         if not restart:
-            self.status.ok("Сохранено. Чтобы бот заработал, перезапустите шлюз.")
+            self.tg_status.ok("Сохранено. Чтобы бот заработал, перезапустите шлюз.")
             return
-        self.btn_apply.setEnabled(False)
-        self.out.clear()
-        self.out.show()
-        self.status.info("Перезапускаю шлюз…")
+        self.tg_apply.setEnabled(False)
+        self.tg_out.clear()
+        self.tg_out.show()
+        self.tg_status.info("Перезапускаю шлюз…")
 
         def work():
-            return backend.restart_gateway(lambda line: self.ctx.bus.post(lambda l=line: self.out.appendPlainText(l)))
+            return backend.restart_gateway(lambda line: self.ctx.bus.post(lambda l=line: self.tg_out.appendPlainText(l)))
 
         def done(msg, err):
-            self.btn_apply.setEnabled(True)
-            self.status.bad(str(err)) if err else self.status.ok(str(msg))
+            self.tg_apply.setEnabled(True)
+            self.tg_status.bad(str(err)) if err else self.tg_status.ok(str(msg))
         background(self.ctx.bus, work, done)
-
-
-# --------------------------------------------------------------------------
-# Чат
-# --------------------------------------------------------------------------
-
-class ChatPage(Page):
-    title = "Чат"
-    lead = "То же самое, но текстом: пишите просьбы Джарвису без микрофона. Голосовой разговор тоже виден здесь."
-
-    def build(self) -> None:
-        self.view = QTextBrowser()
-        self.view.setMinimumHeight(320)
-        self.view.setOpenExternalLinks(False)
-        self.col.addWidget(self.view, 1)
-        row = QHBoxLayout()
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Напишите просьбу и нажмите Enter")
-        self.send = primary("Отправить")
-        row.addWidget(self.input, 1)
-        row.addWidget(self.send)
-        w = QWidget()
-        w.setLayout(row)
-        self.col.addWidget(w)
-        self.speak = QCheckBox("Озвучивать ответы")
-        self.col.addWidget(self.speak)
-        self.busy = False
-        self.send.clicked.connect(self.submit)
-        self.input.returnPressed.connect(self.submit)
-
-    def submit(self) -> None:
-        text = self.input.text().strip()
-        if not text or self.busy:
-            return
-        self.input.clear()
-        self.busy = True
-        self.send.setEnabled(False)
-        self.ctx.service.ask_text(text, speak=self.speak.isChecked())
-
-    def _line(self, who: str, color: str, text: str) -> None:
-        self.view.append(f'<p><span style="color:{color}"><b>{who}</b></span><br>{html.escape(text).replace(chr(10), "<br>")}</p>')
-
-    def on_event(self, kind: str, text: str) -> None:
-        if kind == "heard":
-            self._line("Вы", theme.ACCENT, text)
-        elif kind == "reply":
-            self._line("Джарвис", theme.OK, text)
-            self._idle()
-        elif kind == "error":
-            self._line("Ошибка", theme.BAD, text)
-            self._idle()
-
-    def _idle(self) -> None:
-        self.busy = False
-        self.send.setEnabled(True)
 
 
 # --------------------------------------------------------------------------

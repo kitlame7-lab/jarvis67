@@ -24,6 +24,8 @@ jobs:
         run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Статическая проверка
         run: python -m pyflakes jarvis tools tests
+      - name: Анализатор кода (сеть и процессы без времени ожидания, кодировки, вечные ожидания)
+        run: python tools/doctor.py --strict
       - name: Тесты
         run: python -m pytest -q
         env:

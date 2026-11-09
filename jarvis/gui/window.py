@@ -12,8 +12,9 @@ from .. import __version__, service as svc
 from ..core import log
 from . import theme
 from .common import Page, UiBus, background
-from .pages import AbilitiesPage, HearingPage, HomePage, ModelPage, VoicePage
-from .pages2 import ChatPage, LogPage, SystemPage, TelegramPage
+from .pages import AbilitiesPage, HearingPage, HomePage, VoicePage
+from .pages2 import SystemPage
+from .pages3 import ConnectionsPage, DiagnosticsPage, TasksPage
 from .updates import UpdateController, auto_check_enabled
 
 CHECK_EVERY_MS = 6 * 3600 * 1000
@@ -23,13 +24,17 @@ class Context(QObject):
     """Всё, что нужно страницам: ассистент, шина потоков, обновления."""
     state_changed = Signal(str, str)
     event = Signal(str, str)
+    progress = Signal(float, str)
+    recording_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         self.bus = UiBus(self)
         self.service = svc.AssistantService(
             on_state=lambda s, d: self.bus.post(lambda: self.state_changed.emit(s, d)),
-            on_event=lambda k, t: self.bus.post(lambda: self.event.emit(k, t)))
+            on_event=lambda k, t: self.bus.post(lambda: self.event.emit(k, t)),
+            on_progress=lambda f, t: self.bus.post(lambda: self.progress.emit(f, t)),
+            on_recording=lambda r: self.bus.post(lambda: self.recording_changed.emit(r)))
         self.updates = UpdateController(self.bus)
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -129,7 +134,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(right, 1)
 
         self.pages: List[Page] = []
-        for cls in (HomePage, ModelPage, VoicePage, HearingPage, AbilitiesPage, TelegramPage, ChatPage, LogPage, SystemPage):
+        for cls in (HomePage, TasksPage, VoicePage, HearingPage, AbilitiesPage, ConnectionsPage, DiagnosticsPage, SystemPage):
             page = cls(ctx)
             self.pages.append(page)
             self.stack.addWidget(page)
@@ -139,12 +144,15 @@ class MainWindow(QMainWindow):
 
         ctx.state_changed.connect(self.on_state)
         ctx.event.connect(self.on_event)
+        ctx.progress.connect(self.on_progress)
+        ctx.recording_changed.connect(self.on_recording)
         ctx.updates.changed.connect(self.on_update_changed)
         later.clicked.connect(self.banner.hide)
         self.btn_banner.clicked.connect(ctx.updates.install)
 
         # --- трей
         self.quitting = False
+        self.recording = False
         self.tray: Optional[QSystemTrayIcon] = None
         self.told_tray = False
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -163,13 +171,14 @@ class MainWindow(QMainWindow):
 
     # --- события ассистента ---------------------------------------------------
     def on_state(self, state: str, detail: str) -> None:
-        self.foot_dot.setPixmap(theme.dot(theme.STATE_COLOR.get(state, theme.MUTED), 10))
-        self.foot_text.setText(svc.STATE_TEXT.get(state, state))
+        if not self.recording:
+            self.foot_dot.setPixmap(theme.dot(theme.STATE_COLOR.get(state, theme.MUTED), 10))
+            self.foot_text.setText(svc.STATE_TEXT.get(state, state))
         for p in self.pages:
             if hasattr(p, "on_state"):
                 p.on_state(state, detail)
         if self.tray is not None:
-            self.tray.setIcon(theme.make_icon(state))
+            self.tray.setIcon(theme.make_icon("recording" if self.recording else state))
             self.tray.setToolTip(f"Джарвис: {svc.STATE_TEXT.get(state, state)}")
             self.pause_action.setText("Продолжить" if state == svc.PAUSED else "Пауза")
             self.pause_action.setEnabled(state in (svc.LISTENING, svc.PAUSED))
@@ -178,6 +187,31 @@ class MainWindow(QMainWindow):
         for p in self.pages:
             if hasattr(p, "on_event"):
                 p.on_event(kind, text)
+
+    def on_progress(self, fraction: float, text: str) -> None:
+        for p in self.pages:
+            if hasattr(p, "on_progress"):
+                p.on_progress(fraction, text)
+
+    def on_recording(self, recording: bool) -> None:
+        """Во время записи значок в трее красный: так видно, что Джарвис следит за действиями."""
+        self.recording = recording
+        for p in self.pages:
+            if hasattr(p, "on_recording"):
+                p.on_recording(recording)
+        if recording:
+            self.foot_dot.setPixmap(theme.dot(theme.REC, 10))
+            self.foot_text.setText("Идёт запись действий")
+        else:
+            self.on_state(self.ctx.service.state, self.ctx.service.detail)
+        if self.tray is not None:
+            self.tray.setIcon(theme.make_icon("recording" if recording else self.ctx.service.state))
+            self.tray.setToolTip("Джарвис записывает ваши действия" if recording else
+                                 f"Джарвис: {svc.STATE_TEXT.get(self.ctx.service.state, '')}")
+            self.stop_rec_action.setVisible(recording)
+            if recording:
+                self.tray.showMessage("Идёт запись", "Скажите «стоп» или выберите «Остановить запись» в меню значка.",
+                                      QSystemTrayIcon.MessageIcon.Information, 4000)
 
     # --- обновления -----------------------------------------------------------
     def on_update_changed(self) -> None:
@@ -206,8 +240,10 @@ class MainWindow(QMainWindow):
         open_a = QAction("Открыть Джарвиса", self)
         self.pause_action = QAction("Пауза", self)
         restart_a = QAction("Перезапустить", self)
+        self.stop_rec_action = QAction("Остановить запись", self)
+        self.stop_rec_action.setVisible(False)
         quit_a = QAction("Выход", self)
-        for a in (open_a, self.pause_action, restart_a):
+        for a in (open_a, self.stop_rec_action, self.pause_action, restart_a):
             menu.addAction(a)
         menu.addSeparator()
         menu.addAction(quit_a)
@@ -217,10 +253,16 @@ class MainWindow(QMainWindow):
         self.pause_action.triggered.connect(
             lambda: self.ctx.service.set_paused(self.ctx.service.state != svc.PAUSED))
         restart_a.triggered.connect(self.ctx.restart_service)
+        self.stop_rec_action.triggered.connect(self.stop_recording)
         quit_a.triggered.connect(self.quit_requested.emit)
         self.tray.activated.connect(
             lambda reason: self.bring_to_front() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
+
+    def stop_recording(self) -> None:
+        teacher = self.ctx.service.teacher
+        if teacher:
+            teacher.stop()
 
     def bring_to_front(self) -> None:
         self.showNormal()

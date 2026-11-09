@@ -76,6 +76,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     from PySide6.QtWidgets import QApplication
 
     setup_logging()
+    from . import diag
+    diag.install_hooks()                 # необработанные сбои попадают в диагностику, а не пропадают молча
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Jarvis")
     app.setApplicationVersion(__version__)

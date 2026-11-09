@@ -62,7 +62,7 @@ class GuiBase(unittest.TestCase):
 class WindowTests(GuiBase):
     def test_every_page_opens(self):
         titles = [p.title for p in self.w.pages]
-        self.assertEqual(titles, ["Главное", "Модель", "Голос", "Слух", "Возможности", "Telegram", "Чат", "Журнал", "Система"])
+        self.assertEqual(titles, ["Главное", "Задачи", "Голос", "Слух", "Возможности", "Подключения", "Диагностика", "Система"])
         for t in titles:
             page(self.w, t)
 
@@ -110,7 +110,7 @@ class ModelPageTests(GuiBase):
         super().setUp()
         self.srv = FakeOpenAI()
         self.addCleanup(self.srv.close)
-        self.p = page(self.w, "Модель")
+        self.p = page(self.w, "Подключения")
 
     def choose(self, pid):
         self.p.provider.setCurrentIndex(self.p.provider.findData(pid))
@@ -287,35 +287,40 @@ class VoiceHearingAbilitiesTests(GuiBase):
 
 class TelegramChatLogSystemTests(GuiBase):
     def test_telegram_save(self):
-        p = page(self.w, "Telegram")
+        p = page(self.w, "Подключения")
         p.token.setText("123:ABC")
         p.users.setText("111, 222")
-        p.btn_save.click()
+        p.tg_save.click()
         env = backend.read_env_file(backend.hermes_home() / ".env")
         self.assertEqual((env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_ALLOWED_USERS"]), ("123:ABC", "111,222"))
         self.assertEqual(p.token.text(), "")
         self.assertIn("Ключ сохранён", p.token_state.text())
         p.users.setText("не цифры")
-        p.btn_save.click()
-        self.assertIn("цифры", p.status.text())
+        p.tg_save.click()
+        self.assertIn("цифры", p.tg_status.text())
 
-    def test_chat_roundtrip_through_hermes(self):
-        p = page(self.w, "Чат")
-        p.input.setText("покажи погоду")
-        p.send.click()
-        self.assertTrue(wait_for(lambda: "покажи погоду" in p.view.toPlainText() and "Выполнено" in p.view.toPlainText()))
-        self.assertTrue(p.send.isEnabled())
-        self.assertEqual(p.input.text(), "")
+    def test_home_text_command_roundtrip_through_hermes(self):
+        p = page(self.w, "Главное")
+        p.cmd.setText("покажи погоду")
+        p.btn_send.click()
+        self.assertTrue(wait_for(lambda: "Выполнено" in p.reply.text()))
+        self.assertEqual(p.heard.text(), "покажи погоду")
+        self.assertTrue(p.btn_send.isEnabled())
+        self.assertEqual(p.cmd.text(), "")
 
-    def test_chat_escapes_html(self):
-        p = page(self.w, "Чат")
-        self.ctx.event.emit("reply", "<b>жирный</b> & <script>")
-        self.assertIn("<b>жирный</b>", p.view.toPlainText())
+    def test_home_progress_bar_follows_download(self):
+        p = page(self.w, "Главное")
+        self.assertTrue(p.progress.isHidden())
+        self.ctx.progress.emit(0.42, "Скачиваю")
+        self.assertFalse(p.progress.isHidden())
+        self.assertEqual(p.progress.value(), 420)
+        self.ctx.progress.emit(-1.0, "")
+        self.assertTrue(p.progress.isHidden())
 
     def test_log_page_shows_log(self):
         paths.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         paths.LOG_PATH.write_text("12:00:00 INFO Слушаю\n", encoding="utf-8")
-        p = page(self.w, "Журнал")
+        p = page(self.w, "Диагностика")
         self.assertIn("Слушаю", p.text.toPlainText())
 
     def test_system_page_status(self):

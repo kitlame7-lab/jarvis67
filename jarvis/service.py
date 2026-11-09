@@ -291,6 +291,7 @@ class AssistantService:
             assistant.notify(message)
         else:
             self.on_event("reply", message)
+        self.on_event("tasks", message if task is not None else "")      # страница «Задачи» обновит список
 
     def run_task(self, task: Any) -> str:
         """Запускает записанную задачу через jarvis-pc и возвращает, что сказать пользователю."""
