@@ -170,7 +170,7 @@ class FlowTests(unittest.TestCase):
         a.handle_transcript("Джарвис, запомни слово арбуз")
         a.handle_transcript("Джарвис, какое слово я назвал")
         text = LAST_PROMPT.read_text(encoding="utf-8")
-        for frag in ("Недавний разговор", "арбуз", "сэр", "jarvis-pc", "сирот"):
+        for frag in ("Недавний разговор", "арбуз", "сэр", "jarvis-pc", "проактивным"):
             self.assertIn(frag, text)
 
     def test_history_expires(self):

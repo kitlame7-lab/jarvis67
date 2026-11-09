@@ -451,6 +451,422 @@ def cmd_rate(a) -> str:
 
 
 # --------------------------------------------------------------------------
+# Файловая система
+# --------------------------------------------------------------------------
+
+def _human_size(size: int) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if size < 1024:
+            return f"{size:.1f} {unit}" if unit != "Б" else f"{size} Б"
+        size /= 1024  # type: ignore[assignment]
+    return f"{size:.1f} ПБ"
+
+
+def cmd_files(a) -> str:
+    action = a.action
+    target = " ".join(a.path).strip() if a.path else ""
+
+    if action == "list":
+        p = Path(target) if target else Path.home() / "Desktop"
+        if not p.exists():
+            raise ToolError(f"Папка не найдена: {p}")
+        entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:30]
+        if not entries:
+            return f"Папка {p.name} пуста."
+        lines = []
+        for e in entries:
+            icon = "📁" if e.is_dir() else "📄"
+            sz = ""
+            if e.is_file():
+                try:
+                    sz = f" ({_human_size(e.stat().st_size)})"
+                except OSError:
+                    pass
+            lines.append(f"  {icon} {e.name}{sz}")
+        return f"Содержимое {p}:\n" + "\n".join(lines)
+
+    if action == "search":
+        if not target:
+            raise ToolError("Укажите что искать.")
+        start = Path(a.extra[0]) if a.extra else Path.home()
+        pattern = f"*{target}*"
+        found = []
+        try:
+            for item in start.rglob(pattern):
+                found.append(str(item))
+                if len(found) >= 15:
+                    break
+        except PermissionError:
+            pass
+        if not found:
+            return f"Ничего не найдено по запросу «{target}»."
+        return f"Найдено ({len(found)}):\n" + "\n".join(f"  {f}" for f in found)
+
+    if action == "size":
+        p = Path(target) if target else Path.home() / "Desktop"
+        if not p.exists():
+            raise ToolError(f"Не найдено: {p}")
+        if p.is_file():
+            return f"{p.name}: {_human_size(p.stat().st_size)}"
+        total = 0
+        count = 0
+        for f in p.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                    count += 1
+                except OSError:
+                    pass
+        return f"{p.name}: {_human_size(total)}, файлов: {count}"
+
+    if action == "move":
+        if not target or not a.extra:
+            raise ToolError("Нужны два пути: откуда и куда.")
+        src, dst = Path(target), Path(a.extra[0])
+        if not src.exists():
+            raise ToolError(f"Не найдено: {src}")
+        if DRY:
+            return f"[сухой прогон] Переместил бы {src} → {dst}"
+        import shutil as _shutil
+        _shutil.move(str(src), str(dst))
+        return f"Перемещено: {src.name} → {dst}"
+
+    if action == "copy":
+        if not target or not a.extra:
+            raise ToolError("Нужны два пути: откуда и куда.")
+        src, dst = Path(target), Path(a.extra[0])
+        if not src.exists():
+            raise ToolError(f"Не найдено: {src}")
+        if DRY:
+            return f"[сухой прогон] Скопировал бы {src} → {dst}"
+        import shutil as _shutil
+        if src.is_dir():
+            _shutil.copytree(str(src), str(dst))
+        else:
+            _shutil.copy2(str(src), str(dst))
+        return f"Скопировано: {src.name} → {dst}"
+
+    if action == "delete":
+        if not target:
+            raise ToolError("Укажите что удалить.")
+        p = Path(target)
+        if not p.exists():
+            raise ToolError(f"Не найдено: {p}")
+        if DRY:
+            return f"[сухой прогон] Удалил бы {p}"
+        if IS_WIN:
+            # Удаление в корзину через PowerShell
+            ps = (f'Add-Type -AssemblyName Microsoft.VisualBasic;'
+                  f'[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
+                  f'"{p}", "OnlyErrorDialogs", "SendToRecycleBin")')
+            res = run_cmd(["powershell", "-NoProfile", "-Command", ps])
+            if res.returncode != 0:
+                raise ToolError(f"Не удалось удалить: {res.stderr or res.stdout}")
+            return f"Удалено в корзину: {p.name}"
+        else:
+            p.unlink() if p.is_file() else None
+            return f"Удалено: {p.name}"
+
+    if action == "create-folder":
+        if not target:
+            raise ToolError("Укажите путь для новой папки.")
+        p = Path(target)
+        if DRY:
+            return f"[сухой прогон] Создал бы папку {p}"
+        p.mkdir(parents=True, exist_ok=True)
+        return f"Папка создана: {p}"
+
+    if action == "read":
+        if not target:
+            raise ToolError("Укажите файл для чтения.")
+        p = Path(target)
+        if not p.exists():
+            raise ToolError(f"Файл не найден: {p}")
+        if p.stat().st_size > 50000:
+            return f"Файл слишком большой ({_human_size(p.stat().st_size)}). Показываю первые строки."
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")[:3000]
+        except OSError as exc:
+            raise ToolError(f"Не удалось прочитать: {exc}") from exc
+        return f"Содержимое {p.name}:\n{text}"
+
+    raise ToolError(f"Неизвестное действие с файлами: {action}")
+
+
+# --------------------------------------------------------------------------
+# Системная информация
+# --------------------------------------------------------------------------
+
+def cmd_sysinfo(_a) -> str:
+    parts = []
+    # CPU
+    try:
+        if IS_WIN:
+            res = run_cmd(["wmic", "cpu", "get", "Name,LoadPercentage", "/format:list"])
+            for line in (res.stdout or "").splitlines():
+                if line.startswith("Name="):
+                    parts.append(f"Процессор: {line.split('=', 1)[1].strip()}")
+                if line.startswith("LoadPercentage="):
+                    parts.append(f"Загрузка CPU: {line.split('=', 1)[1].strip()}%")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # RAM
+    try:
+        if IS_WIN:
+            res = run_cmd(["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/format:list"])
+            vals = {}
+            for line in (res.stdout or "").splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    vals[k.strip()] = int(v.strip()) if v.strip().isdigit() else 0
+            total = vals.get("TotalVisibleMemorySize", 0) * 1024
+            free = vals.get("FreePhysicalMemory", 0) * 1024
+            if total:
+                used_pct = int((total - free) / total * 100)
+                parts.append(f"Память: {_human_size(total - free)} из {_human_size(total)} ({used_pct}%)")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Disk
+    try:
+        if IS_WIN:
+            res = run_cmd(["wmic", "logicaldisk", "where", "DriveType=3",
+                          "get", "Caption,FreeSpace,Size", "/format:list"])
+            blocks = (res.stdout or "").split("\n\n")
+            for block in blocks:
+                vals = {}
+                for line in block.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        vals[k.strip()] = v.strip()
+                if "Caption" in vals and "Size" in vals:
+                    total = int(vals["Size"]) if vals["Size"].isdigit() else 0
+                    free = int(vals.get("FreeSpace", "0")) if vals.get("FreeSpace", "").isdigit() else 0
+                    if total:
+                        parts.append(f"Диск {vals['Caption']} свободно {_human_size(free)} из {_human_size(total)}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Battery
+    try:
+        if IS_WIN:
+            res = run_cmd(["wmic", "path", "Win32_Battery", "get",
+                          "EstimatedChargeRemaining,BatteryStatus", "/format:list"])
+            for line in (res.stdout or "").splitlines():
+                if line.startswith("EstimatedChargeRemaining="):
+                    pct = line.split("=", 1)[1].strip()
+                    if pct.isdigit():
+                        parts.append(f"Батарея: {pct}%")
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not parts:
+        return "Не удалось получить информацию о системе."
+    return "; ".join(parts) + "."
+
+
+# --------------------------------------------------------------------------
+# Процессы
+# --------------------------------------------------------------------------
+
+def cmd_processes(a) -> str:
+    if not IS_WIN and not DRY:
+        raise ToolError("Список процессов доступен только на Windows.")
+    query = " ".join(a.query).strip().lower() if a.query else ""
+    res = run_cmd(["tasklist", "/FO", "CSV", "/NH"])
+    lines = (res.stdout or "").strip().splitlines()
+    procs = []
+    for line in lines:
+        parts_csv = line.strip('"').split('","')
+        if len(parts_csv) >= 5:
+            name = parts_csv[0]
+            pid = parts_csv[1]
+            mem = parts_csv[4].replace(" ", "").replace("КБ", "").replace("K", "")
+            if query and query not in name.lower():
+                continue
+            procs.append((name, pid, mem))
+    if query:
+        if not procs:
+            return f"Процесс «{query}» не найден."
+        result = f"Найдено процессов «{query}»: {len(procs)}\n"
+        for name, pid, mem in procs[:15]:
+            result += f"  {name} (PID {pid})\n"
+        return result.strip()
+    # Без фильтра: топ по памяти
+    try:
+        procs.sort(key=lambda x: int(x[2].replace(",", "").replace(".", "")), reverse=True)
+    except (ValueError, IndexError):
+        pass
+    top = procs[:15]
+    result = f"Всего процессов: {len(procs)}. Больше всего памяти занимают:\n"
+    for name, pid, mem in top:
+        result += f"  {name} (PID {pid})\n"
+    return result.strip()
+
+
+def cmd_process_kill(a) -> str:
+    target = " ".join(a.target).strip()
+    if not target:
+        raise ToolError("Укажите имя или PID процесса.")
+    if DRY:
+        return f"[сухой прогон] Завершил бы процесс {target}"
+    if target.isdigit():
+        res = run_cmd(["taskkill", "/F", "/PID", target])
+    else:
+        exe = target if target.lower().endswith(".exe") else target + ".exe"
+        res = run_cmd(["taskkill", "/F", "/IM", exe])
+    if res.returncode == 0:
+        return f"Процесс {target} завершён."
+    detail = (res.stderr or res.stdout or "").strip()
+    raise ToolError(f"Не удалось завершить процесс: {detail}")
+
+
+# --------------------------------------------------------------------------
+# Буфер обмена
+# --------------------------------------------------------------------------
+
+def cmd_clipboard(a) -> str:
+    action = a.action
+    if action == "get":
+        if not IS_WIN and not DRY:
+            raise ToolError("Буфер обмена доступен только на Windows.")
+        res = run_cmd(["powershell", "-NoProfile", "-Command", "Get-Clipboard"])
+        text = (res.stdout or "").strip()
+        if not text:
+            return "Буфер обмена пуст."
+        if len(text) > 500:
+            text = text[:500] + "..."
+        return f"В буфере обмена: {text}"
+    if action == "set":
+        content = " ".join(a.text) if a.text else ""
+        if not content:
+            raise ToolError("Укажите текст для буфера обмена.")
+        if DRY:
+            return f"[сухой прогон] Скопировал бы в буфер: {content[:100]}"
+        # Безопасная передача через stdin
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            input=content, capture_output=True, text=True, encoding="utf-8",
+            creationflags=flags)
+        if proc.returncode != 0:
+            raise ToolError("Не удалось записать в буфер обмена.")
+        return "Текст скопирован в буфер обмена."
+    raise ToolError("Буфер обмена: get или set.")
+
+
+# --------------------------------------------------------------------------
+# Скриншот
+# --------------------------------------------------------------------------
+
+def cmd_screenshot(a) -> str:
+    if not IS_WIN and not DRY:
+        raise ToolError("Скриншот доступен только на Windows.")
+    dest = " ".join(a.path).strip() if a.path else ""
+    if not dest:
+        dest = str(Path.home() / "Desktop" / f"screenshot_{dt.datetime.now():%Y%m%d_%H%M%S}.png")
+    if DRY:
+        return f"[сухой прогон] Скриншот → {dest}"
+    ps = (f'Add-Type -AssemblyName System.Windows.Forms;'
+          f'$bmp = [System.Windows.Forms.Screen]::PrimaryScreen;'
+          f'$bounds = $bmp.Bounds;'
+          f'$bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);'
+          f'$graphics = [System.Drawing.Graphics]::FromImage($bitmap);'
+          f'$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);'
+          f'$bitmap.Save("{dest}");'
+          f'$graphics.Dispose();$bitmap.Dispose()')
+    res = run_cmd(["powershell", "-NoProfile", "-Command", ps])
+    if res.returncode != 0:
+        raise ToolError(f"Не удалось сделать скриншот: {(res.stderr or '')[:200]}")
+    return f"Скриншот сохранён: {dest}"
+
+
+# --------------------------------------------------------------------------
+# Выполнение команд
+# --------------------------------------------------------------------------
+
+def cmd_run(a) -> str:
+    command = " ".join(a.command).strip()
+    if not command:
+        raise ToolError("Укажите команду для выполнения.")
+    if DRY:
+        return f"[сухой прогон] Выполнил бы: {command}"
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        res = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        raise ToolError("Команда выполнялась слишком долго (более 30 секунд).")
+    out = (res.stdout or "").strip()
+    err = (res.stderr or "").strip()
+    if res.returncode != 0 and err:
+        return f"Команда завершилась с ошибкой (код {res.returncode}): {err[:300]}"
+    if out:
+        return f"Результат: {out[:800]}"
+    return "Команда выполнена." if res.returncode == 0 else f"Команда завершилась с кодом {res.returncode}."
+
+
+# --------------------------------------------------------------------------
+# Сеть
+# --------------------------------------------------------------------------
+
+def cmd_network(_a) -> str:
+    parts = []
+    if IS_WIN:
+        res = run_cmd(["ipconfig"])
+        for line in (res.stdout or "").splitlines():
+            line = line.strip()
+            if "IPv4" in line and ":" in line:
+                ip = line.split(":")[-1].strip()
+                parts.append(f"IP: {ip}")
+                break
+        # Wi-Fi SSID
+        res = run_cmd(["netsh", "wlan", "show", "interfaces"])
+        for line in (res.stdout or "").splitlines():
+            if "SSID" in line and "BSSID" not in line and ":" in line:
+                ssid = line.split(":", 1)[-1].strip()
+                if ssid:
+                    parts.append(f"Сеть: {ssid}")
+                break
+    # Проверка интернета
+    try:
+        http_get("https://www.google.com/generate_204", timeout=5)
+        parts.append("Интернет: есть")
+    except ToolError:
+        parts.append("Интернет: нет связи")
+    if not parts:
+        return "Не удалось получить информацию о сети."
+    return "; ".join(parts) + "."
+
+
+# --------------------------------------------------------------------------
+# Уведомления
+# --------------------------------------------------------------------------
+
+def cmd_notify(a) -> str:
+    text = " ".join(a.text).strip()
+    if not text:
+        raise ToolError("Укажите текст уведомления.")
+    if DRY or not IS_WIN:
+        return f"[сухой прогон] Уведомление: {text}"
+    ps = (f'Add-Type -AssemblyName System.Windows.Forms;'
+          f'$n = New-Object System.Windows.Forms.NotifyIcon;'
+          f'$n.Icon = [System.Drawing.SystemIcons]::Information;'
+          f'$n.Visible = $true;'
+          f'$n.ShowBalloonTip(5000, "Джарвис", $env:JARVIS_NOTIFY, "Info");'
+          f'Start-Sleep 6; $n.Dispose()')
+    env = dict(os.environ, JARVIS_NOTIFY=text)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-Command", ps], env=env,
+        creationflags=flags, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return f"Уведомление показано: {text[:100]}"
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -460,7 +876,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, fn in [("minimize-all", cmd_minimize_all), ("restore-all", cmd_restore_all),
                      ("maximize", cmd_maximize), ("minimize", cmd_minimize),
-                     ("timer-cancel", cmd_timer_cancel), ("lock", cmd_lock), ("now", cmd_now)]:
+                     ("timer-cancel", cmd_timer_cancel), ("lock", cmd_lock), ("now", cmd_now),
+                     ("sysinfo", cmd_sysinfo), ("network", cmd_network)]:
         sub.add_parser(name).set_defaults(func=fn)
 
     t = sub.add_parser("timer"); t.add_argument("minutes", type=int); t.set_defaults(func=cmd_timer)
@@ -477,6 +894,33 @@ def build_parser() -> argparse.ArgumentParser:
     w = sub.add_parser("weather"); w.add_argument("city", nargs="*"); w.set_defaults(func=cmd_weather)
 
     r = sub.add_parser("rate"); r.add_argument("currency", nargs="*"); r.set_defaults(func=cmd_rate)
+
+    # Файлы
+    f = sub.add_parser("files")
+    f.add_argument("action", choices=["list", "search", "size", "move", "copy", "delete", "create-folder", "read"])
+    f.add_argument("path", nargs="*")
+    f.add_argument("--to", dest="extra", nargs="*", default=[])
+    f.set_defaults(func=cmd_files)
+
+    # Процессы
+    ps = sub.add_parser("processes"); ps.add_argument("query", nargs="*"); ps.set_defaults(func=cmd_processes)
+    pk = sub.add_parser("process-kill"); pk.add_argument("target", nargs="+"); pk.set_defaults(func=cmd_process_kill)
+
+    # Буфер обмена
+    cb = sub.add_parser("clipboard")
+    cb.add_argument("action", choices=["get", "set"])
+    cb.add_argument("text", nargs="*")
+    cb.set_defaults(func=cmd_clipboard)
+
+    # Скриншот
+    ss = sub.add_parser("screenshot"); ss.add_argument("path", nargs="*"); ss.set_defaults(func=cmd_screenshot)
+
+    # Выполнение команд
+    rn = sub.add_parser("run"); rn.add_argument("command", nargs="+"); rn.set_defaults(func=cmd_run)
+
+    # Уведомления
+    nt = sub.add_parser("notify"); nt.add_argument("text", nargs="+"); nt.set_defaults(func=cmd_notify)
+
     return p
 
 
