@@ -99,6 +99,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .gui import theme
     from .gui.window import Context, MainWindow, shutdown
 
+    theme.set_mode(str(load_settings().get("ui", {}).get("theme", "light")))
     app.setStyleSheet(theme.QSS + theme.asset_qss(paths.CACHE_DIR))
     app.setWindowIcon(theme.make_icon("listening"))
     ctx = Context()

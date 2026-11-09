@@ -140,3 +140,29 @@ class DiagnosticsPageTests(GuiBase):
         self.ctx.event.emit("error", "ещё одно")
         QTest.qWait(300)
         self.assertEqual(p.findings, [], "повторная проверка раньше чем через минуту не нужна")
+
+
+class ThemeTests(GuiBase):
+    def tearDown(self):
+        from jarvis.gui import theme
+        theme.set_mode("light")
+
+    def test_theme_switch_applies_and_is_saved(self):
+        from jarvis import backend
+        from jarvis.gui import theme
+        p = page(self.w, "Система")
+        p.theme_box.setCurrentIndex(p.theme_box.findData("dark"))
+        self.assertEqual(theme.MODE, "dark")
+        self.assertEqual(backend.read_user_settings()["ui"]["theme"], "dark")
+        self.assertIn(theme.PALETTES["dark"]["BG"], theme.QSS)
+        p.theme_box.setCurrentIndex(p.theme_box.findData("light"))
+        self.assertEqual(theme.MODE, "light")
+
+    def test_unknown_theme_is_rejected(self):
+        from jarvis import backend
+        backend.save_settings({"ui": {"theme": "розовая"}})
+        self.assertNotIn("ui", backend.read_user_settings())
+
+    def test_every_palette_defines_the_same_colors(self):
+        from jarvis.gui import theme
+        self.assertEqual(set(theme.PALETTES["light"]), set(theme.PALETTES["dark"]))

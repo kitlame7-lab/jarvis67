@@ -109,6 +109,7 @@ DEFAULTS: Dict[str, Any] = {
         "shots": True,               # снимки экрана при щелчках (видны на странице «Задачи»)
         "max_shots": 60,
     },
+    "ui": {"theme": "light"},        # light | dark
     "updates": {"auto_check": True},
     "history_turns": 6,
     "history_ttl_s": 600,

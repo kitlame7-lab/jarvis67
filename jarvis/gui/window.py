@@ -71,18 +71,27 @@ class MainWindow(QMainWindow):
         # --- боковая панель
         side = QWidget()
         side.setObjectName("sidebar")
-        side.setFixedWidth(220)
+        side.setFixedWidth(240)
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 22, 0, 16)
         sl.setSpacing(0)
-        brand = QLabel("ДЖАРВИС")
+        head = QHBoxLayout()
+        head.setContentsMargins(22, 0, 0, 14)
+        head.setSpacing(10)
+        self.brand_orb = QLabel()
+        self.brand_orb.setPixmap(theme.orb("listening", 36))
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        brand = QLabel("Джарвис")
         brand.setObjectName("brand")
-        brand.setContentsMargins(22, 0, 0, 0)
         sub = QLabel("голосовой помощник")
         sub.setObjectName("brandSub")
-        sub.setContentsMargins(22, 0, 0, 14)
-        sl.addWidget(brand)
-        sl.addWidget(sub)
+        titles.addWidget(brand)
+        titles.addWidget(sub)
+        head.addWidget(self.brand_orb)
+        head.addLayout(titles)
+        head.addStretch(1)
+        sl.addLayout(head)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
         self.nav.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -258,6 +267,19 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(
             lambda reason: self.bring_to_front() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
+
+    def apply_theme(self, mode: str) -> None:
+        """Переключает светлую и тёмную тему на лету."""
+        from .. import paths
+        mode = theme.set_mode(mode)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.QSS + theme.asset_qss(paths.CACHE_DIR))
+        self.setWindowIcon(theme.make_icon("listening"))
+        self.brand_orb.setPixmap(theme.orb("listening", 36))
+        self.on_state(self.ctx.service.state, self.ctx.service.detail)
+        if self.recording:
+            self.on_recording(True)
 
     def stop_recording(self) -> None:
         teacher = self.ctx.service.teacher

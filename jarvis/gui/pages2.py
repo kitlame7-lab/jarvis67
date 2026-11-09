@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QWidget)
 
 from .. import REPO, __version__, backend, core, paths
 from . import theme
@@ -196,6 +196,13 @@ class SystemPage(Page):
         u.add(self.auto)
         self.col.addWidget(u)
 
+        look = Card("Оформление")
+        self.theme_box = QComboBox()
+        self.theme_box.addItem("Светлое", "light")
+        self.theme_box.addItem("Тёмное", "dark")
+        look.add(field("Тема", self.theme_box))
+        self.col.addWidget(look)
+
         o = Card("Прочее")
         b1 = button("Открыть папку с данными")
         b2 = button("Страница проекта на GitHub")
@@ -209,6 +216,7 @@ class SystemPage(Page):
         self.btn_check.clicked.connect(lambda: self.ctx.updates.check(manual=True))
         self.btn_install.clicked.connect(self.ctx.updates.install)
         self.auto.toggled.connect(self.set_auto)
+        self.theme_box.currentIndexChanged.connect(self.set_theme)
         b1.clicked.connect(lambda: open_folder(paths.DATA_DIR))
         b2.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{REPO}")))
         self.ctx.updates.changed.connect(self.refresh_updates)
@@ -225,8 +233,18 @@ class SystemPage(Page):
                                 else "Навык jarvis-pc устарел или не установлен. Нажмите «Переустановить».")
         self._loading = True
         self.auto.setChecked(bool(core.load_settings()["updates"]["auto_check"]))
+        self.theme_box.setCurrentIndex(max(0, self.theme_box.findData(core.load_settings()["ui"]["theme"])))
         self._loading = False
         self.refresh_updates()
+
+    def set_theme(self) -> None:
+        if self._loading:
+            return
+        mode = self.theme_box.currentData()
+        backend.save_settings({"ui": {"theme": mode}})
+        win = self.window()
+        if hasattr(win, "apply_theme"):
+            win.apply_theme(mode)
 
     def set_auto(self, on: bool) -> None:
         if not self._loading:
